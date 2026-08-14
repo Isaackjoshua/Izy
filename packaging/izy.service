@@ -1,0 +1,22 @@
+[Unit]
+Description=Izy focus companion
+# Needs a graphical session for the overlay, and must go away with it.
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/izy/venv/bin/python -m izy.app
+Restart=on-failure
+RestartSec=5
+
+# Overlay positioning requires XWayland: Wayland clients cannot place
+# themselves and Mutter has no layer-shell. See docs/STEP0-ENVIRONMENT.md.
+Environment=QT_QPA_PLATFORM=xcb
+Environment=PYTHONUNBUFFERED=1
+
+# Survive logout/login: the unit is wanted by the graphical session, so it
+# starts again on the next login without needing lingering enabled.
+
+[Install]
+WantedBy=graphical-session.target

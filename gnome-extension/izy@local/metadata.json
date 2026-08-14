@@ -1,0 +1,7 @@
+{
+  "uuid": "izy@local",
+  "name": "Izy Focus Reporter",
+  "description": "Exposes the focused window's title and app id on the session bus at org.izy.Focus, so Izy can tell what you are working on. GNOME/Wayland offers no other route: EWMH returns 0x0, Shell.Eval is locked, and Shell.Introspect is allowlist-gated. Reads only; changes nothing about your session.",
+  "shell-version": ["45", "46", "47", "48"],
+  "session-modes": ["user"]
+}
