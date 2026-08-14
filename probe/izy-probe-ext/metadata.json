@@ -1,0 +1,7 @@
+{
+  "uuid": "izy-probe@local",
+  "name": "Izy Probe (throwaway)",
+  "description": "Step 0 probe only. Exposes the focused window's app + title over D-Bus so we can verify window-title tracking works on GNOME Wayland. Safe to uninstall.",
+  "shell-version": ["45", "46", "47", "48"],
+  "session-modes": ["user"]
+}
