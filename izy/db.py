@@ -154,7 +154,11 @@ def open_event(conn, snap: Snapshot, session_id: int | None) -> int:
     cur = conn.execute(
         "INSERT INTO activity_events(session_id, ts, app, window_title, url, duration_s, afk)"
         " VALUES (?,?,?,?,?,0,?)",
-        (session_id, to_iso(snap.ts), snap.app, snap.title, snap.url, int(snap.afk)),
+        # Store the normalised title: the exact spinner frame at the instant we
+        # happened to sample carries no information, and this is the form the
+        # Tier 3 cache key needs anyway.
+        (session_id, to_iso(snap.ts), snap.app, snap.normalized_title,
+         snap.url, int(snap.afk)),
     )
     return cur.lastrowid
 

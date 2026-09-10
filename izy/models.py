@@ -4,6 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from .titles import normalize_title
+
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -39,10 +41,20 @@ class Snapshot:
     source: str = "unknown"
 
     @property
+    def normalized_title(self) -> str | None:
+        """Title with timer-driven noise removed. See izy/titles.py."""
+        return normalize_title(self.title)
+
+    @property
     def key(self) -> tuple:
         """Identity of the activity span. A change here closes the open span
-        and opens a new one; equal keys are the same continuous activity."""
-        return (self.app, self.title, self.url, self.afk)
+        and opens a new one; equal keys are the same continuous activity.
+
+        Compares the *normalised* title: a spinner frame or a notification
+        count flipping every second is not a change of activity, and treating
+        it as one writes a row per poll instead of a row per activity.
+        """
+        return (self.app, self.normalized_title, self.url, self.afk)
 
     def is_empty(self) -> bool:
         return not self.afk and not self.app and not self.title
