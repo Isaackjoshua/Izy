@@ -12,6 +12,7 @@ import sys
 
 from . import paths
 from .commands import day as day_cmd
+from .commands import config_cmd
 from .commands import env as env_cmd
 from .commands import reminder as reminder_cmd
 from .commands import report as report_cmd
@@ -65,6 +66,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("stop", help="end the open focus session")
     sp.add_argument("outcome", nargs="?", choices=["finished", "partly", "no"])
     sp.set_defaults(func=session_cmd.cmd_stop)
+
+    cf = sub.add_parser("config", help="show the config file and whether it is current")
+    cf.add_argument("--upgrade", action="store_true",
+                    help="add missing sections and keys, preserving your edits")
+    cf.set_defaults(func=config_cmd.cmd_config)
 
     doc = sub.add_parser("doctor", help="re-check that activity tracking works")
     doc.set_defaults(func=env_cmd.cmd_doctor)

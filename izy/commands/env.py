@@ -47,6 +47,15 @@ def cmd_doctor(args) -> int:
     from ..capture import describe as describe_capture
     print(f"screen capture : {describe_capture(cfg)}")
 
+    from ..config_upgrade import plan_for
+    from .. import paths
+    config_path = paths.config_path()
+    if config_path.exists():
+        plan = plan_for(config_path.read_text())
+        print(f"config         : {plan.describe()}")
+        if not plan.empty:
+            print("  -> run: izy config --upgrade")
+
     watcher = pick_watcher(cfg.watcher)
     describe = getattr(watcher, "describe", None)
     print(f"chosen watcher : {describe() if describe else watcher.name}")

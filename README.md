@@ -285,5 +285,13 @@ is no display.
 ## Config
 
 `~/.config/izy/config.toml`, written with comments on first run, explaining
-every knob — especially the interruption budget numbers, which are the ones
-worth tuning. There is deliberately no settings GUI.
+every knob — especially the interruption budget numbers and the classify rule
+lists, which are the ones worth tuning. There is deliberately no settings GUI.
+
+The defaults are only written when the file does not exist, so a config from an
+earlier version is missing anything added since. `izy config` says whether
+yours is current, and `izy config --upgrade` merges in the missing sections and
+keys with their comments — it never rewrites a value you have set, keeps your
+own comments, and leaves a `.bak` alongside. `izy doctor` mentions it when an
+upgrade is available. Nothing does this automatically; silently rewriting a
+file you own is not this tool's business.
