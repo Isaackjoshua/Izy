@@ -264,3 +264,57 @@ class ConfirmReminderPrompt(Popup):
     def showEvent(self, e):
         super().showEvent(e)
         self.edit.setFocus()
+
+
+class OnTaskPrompt(Popup):
+    """Tier 4: one tap, when the paid tier was not confident enough to trust.
+
+    Shows the intent alongside the window, because the question is not "is this
+    productive" but "is this related to what you said you were doing".
+    """
+
+    answered = Signal(bool)
+
+    def __init__(self, intent: str, what: str) -> None:
+        super().__init__(focusable=False)
+        self.body.addWidget(QLabel(_ellipsize(what, 72)))
+        sub = QLabel(_ellipsize(f"Working on: {intent}", 72))
+        sub.setObjectName("dim")
+        self.body.addWidget(sub)
+
+        row = QHBoxLayout(); row.setSpacing(6)
+        on = QPushButton("On task"); on.setObjectName("primary")
+        off = QPushButton("Off task")
+        skip = QPushButton("Skip")
+        on.clicked.connect(lambda: (self.answered.emit(True), self.close()))
+        off.clicked.connect(lambda: (self.answered.emit(False), self.close()))
+        skip.clicked.connect(lambda: (self.dismissed.emit(), self.close()))
+        row.addWidget(on); row.addWidget(off); row.addStretch(1); row.addWidget(skip)
+        self.body.addLayout(row)
+
+
+class DriftAlert(Popup):
+    """The one thing Izy says unprompted about your work.
+
+    The message is passed in already formatted by drift.py and is shown
+    verbatim — no encouragement appended here, ever. Two buttons: acknowledge,
+    or dismiss (which starts the cooldown).
+    """
+
+    acknowledged = Signal()
+    dismissed_drift = Signal()
+
+    def __init__(self, message: str) -> None:
+        super().__init__(focusable=False)
+        label = QLabel(_ellipsize(message, 96))
+        label.setWordWrap(True)
+        f = QFont(); f.setPointSize(11); label.setFont(f)
+        self.body.addWidget(label)
+
+        row = QHBoxLayout(); row.setSpacing(6)
+        ok = QPushButton("Back to it"); ok.setObjectName("primary")
+        later = QPushButton("Not now")
+        ok.clicked.connect(lambda: (self.acknowledged.emit(), self.close()))
+        later.clicked.connect(lambda: (self.dismissed_drift.emit(), self.close()))
+        row.addStretch(1); row.addWidget(later); row.addWidget(ok)
+        self.body.addLayout(row)

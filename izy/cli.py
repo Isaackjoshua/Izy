@@ -105,11 +105,67 @@ def cmd_day(args) -> int:
         _day_bounds_for(day)).fetchone()[0]
     print(f"\nLLM  {calls[0]} paid call(s), ${calls[1]:.4f}, {cached} cache hit(s)")
 
-    print(f"\nLabels ({len(labels)})")
+    by_source: dict[str, int] = {}
+    on_task_s = off_task_s = 0.0
     for l in labels:
-        mark = "on-task " if l["on_task"] else "off-task"
-        print(f"  {_local(l['created_at'])}  {mark}  [{l['source']}]  "
-              f"{(l['window_title'] or l['app'] or '')[:56]}")
+        by_source[l["source"]] = by_source.get(l["source"], 0) + 1
+    for e in events:
+        lab = conn.execute(
+            "SELECT on_task FROM labels WHERE event_id=? ORDER BY id DESC LIMIT 1",
+            (e["id"],)).fetchone()
+        if lab is None or e["afk"]:
+            continue
+        if lab["on_task"]:
+            on_task_s += e["duration_s"]
+        else:
+            off_task_s += e["duration_s"]
+
+    judged = on_task_s + off_task_s
+    share = f"{on_task_s / judged * 100:.0f}% on task" if judged else "nothing judged"
+    print(f"\nClassification  {_fmt_dur(on_task_s)} on / {_fmt_dur(off_task_s)} off"
+          f"  ({share})")
+    if by_source:
+        print("  by source: " + ", ".join(f"{k}={v}" for k, v in sorted(by_source.items())))
+
+    # The audit SPEC.md Feature 5 asks for: every paid and asked decision, with
+    # its reason, so a wrong one can be spotted and corrected.
+    audit = [l for l in labels if l["source"] in ("llm", "user")]
+    if audit:
+        print(f"\nAudit ({len(audit)} tier 3/4 decision(s))")
+        for l in audit:
+            mark = "on-task " if l["on_task"] else "off-task"
+            conf = f"{l['confidence']:.2f}" if l["confidence"] is not None else "  - "
+            print(f"  {_local(l['created_at'])}  {mark} {conf} [{l['source']}]  "
+                  f"{(l['window_title'] or l['app'] or '')[:40]:<40} "
+                  f"{(l['reason'] or '')[:40]}")
+        print("  wrong? correct it with:  izy relabel <event-id> on|off")
+
+    if args.verbose:
+        print(f"\nAll labels ({len(labels)})")
+        for l in labels:
+            mark = "on-task " if l["on_task"] else "off-task"
+            print(f"  {_local(l['created_at'])}  {mark}  [{l['source']}]  "
+                  f"{(l['window_title'] or l['app'] or '')[:56]}")
+    return 0
+
+
+def cmd_relabel(args) -> int:
+    """Correct a classification. Every correction is a training example, so this
+    has to be effortless — SPEC.md Feature 5."""
+    conn = db.connect()
+    row = conn.execute("SELECT * FROM activity_events WHERE id=?",
+                       (args.event_id,)).fetchone()
+    if row is None:
+        print(f"no event {args.event_id}", file=sys.stderr)
+        return 1
+    on_task = args.verdict in ("on", "on-task", "true", "1")
+
+    from .classifier import Classifier
+    from .llm import LLM
+    cfg = config.load()
+    Classifier(conn, cfg, LLM(conn, cfg)).record_user_answer(args.event_id, on_task)
+    print(f"event {args.event_id} ({row['app']} — {row['window_title']}) "
+          f"-> {'on-task' if on_task else 'off-task'}")
     return 0
 
 
@@ -325,6 +381,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("stop", help="end the open focus session")
     sp.add_argument("outcome", nargs="?", choices=["finished", "partly", "no"])
     sp.set_defaults(func=cmd_stop)
+
+    rel = sub.add_parser("relabel", help="correct a classification")
+    rel.add_argument("event_id", type=int)
+    rel.add_argument("verdict", choices=["on", "off"])
+    rel.set_defaults(func=cmd_relabel)
 
     rm = sub.add_parser("remind", help='add a reminder, e.g. izy remind me to X at 4pm')
     rm.add_argument("text", nargs="+", help="the reminder, in plain English")

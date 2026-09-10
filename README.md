@@ -8,10 +8,10 @@ attention actually went.
 Personal tool, one machine, one person. Nothing leaves the machine.
 `SPEC.md` is the source of truth for scope.
 
-**Status: Phase 2 (reminders) complete.** Phase 1 records what happened and asks
-once an hour whether it was on task, so the `labels` table has real examples in
-it before the classifier is written. Phase 2 adds reminders in natural language.
-There is still no classification — that is Phase 3.
+**Status: Phase 3 (classification) complete.** Izy logs where your attention
+goes, holds reminders, judges activity against what you said you were working
+on, and says something at most rarely when you drift. Phase 4 is the
+retrospective dashboard.
 
 ## Install
 
@@ -57,6 +57,54 @@ bubble with done / snooze / dismiss — never modal, never focus-stealing, silen
 
 Reminders are things you asked for, so they do not consume the interruption
 budget, which is reserved for things Izy decides to say on its own.
+
+## Classification
+
+Activity is judged against **what you said you were working on**, not against
+productivity in the abstract — reading docs or searching an error message is
+on-task for a programming session. The ladder stops at the first confident
+answer, cheapest first:
+
+| Tier | Input | Cost |
+|---|---|---|
+| 1 | app + window title vs. your allow/deny rules | free |
+| 2 | browser tab URL | free |
+| 3 | one LLM call, batched and cached | paid |
+| 4 | asks you, one tap | free |
+
+Cost discipline is enforced, not hoped for: spans under `min_duration_s` are
+never judged, events with no declared intent never reach tier 3, ambiguous
+events are buffered and judged several per call, and the cache is keyed on
+`(intent, app, normalized_title)` so the same window never costs twice in a
+session. Measured on a simulated working day in `tests/test_classifier.py`:
+**well under the 50-call budget**, roughly one call per session after caching.
+
+**On exceeding the budget it asks you. It never degrades to a guess.** The same
+is true when there is no API key, when the model is unsure (below
+`confidence_threshold`), and when a verdict comes back missing.
+
+Add to the `on_task_apps` / `off_task_apps` / `*_urls` lists in the config
+whenever tier 3 or tier 4 asks about something you consider obvious — every
+rule you add is a call you never pay for again.
+
+Correct a wrong call with `izy relabel <event-id> on|off`; `izy day` prints the
+audit of every tier 3 and tier 4 decision with its reason.
+
+## Drift alerts
+
+The only thing Izy says unprompted about your work, and deliberately hard to
+trigger. It names what you declared and what you are doing instead, and nothing
+else:
+
+```
+You said: fix the dataloader. YouTube, 11 min.
+```
+
+Off-task must persist 4+ minutes; at most 3 unsolicited interruptions an hour,
+ever; 15-minute cooldown after you dismiss one; never during a 20-minute
+deep-work streak; **one alert per drift run, not one per tick**; and walking
+away is not drift. Set `drift.enabled = false` to classify silently and only
+see it in the retrospective.
 
 ## LLM calls
 
@@ -129,6 +177,9 @@ izy/
   sessions.py  focus sessions, breaks, restart recovery
   budget.py    interruption budget enforcement
   llm.py       the ONLY module that talks to the Anthropic API
+  rules.py     tiers 1-2: the free classification rules
+  classifier.py  the ladder, batching, caching, tier 4 escalation
+  drift.py     when Izy is allowed to say you have drifted
   reminders/   natural-language parsing, storage, firing rules
   selflabel.py the hourly "were you on task?" policy
   worker.py    the tracking thread

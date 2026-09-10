@@ -129,6 +129,32 @@ def _build_bridge():
                 lambda when: self.worker.request_add_reminder(f"{original} {when}"))
             self._place(c, focus=True)
 
+        @Slot(int, str, str)
+        def on_ask_on_task(self, event_id: int, intent: str, what: str) -> None:
+            from .ui.prompts import OnTaskPrompt
+            p = self._keep(OnTaskPrompt(intent, what))
+            p.answered.connect(
+                lambda ok: self.worker.request_on_task_answer(event_id, ok))
+            self._place(p)
+
+        @Slot(int, str)
+        def on_show_drift(self, intervention_id: int, message: str) -> None:
+            from .ui.prompts import DriftAlert
+            a = self._keep(DriftAlert(message))
+            a.acknowledged.connect(
+                lambda: self.worker.request_drift_response(intervention_id,
+                                                           "acknowledged"))
+            a.dismissed_drift.connect(
+                lambda: self.worker.request_drift_response(intervention_id,
+                                                           "dismissed"))
+            # Ignoring an alert is a dismissal: it starts the cooldown, which is
+            # the behaviour that keeps Izy from becoming something you close.
+            a.dismissed.connect(
+                lambda: self.worker.request_drift_response(intervention_id,
+                                                           "dismissed"))
+            self._place(a)
+            self.mascot.set_state("soft-alert")
+
         @Slot(str)
         def on_status(self, msg: str) -> None:
             log.info("%s", msg)
@@ -182,6 +208,8 @@ def run(argv: list[str] | None = None) -> int:
     tracker.worker.phase_changed.connect(bridge.on_phase)
     tracker.worker.ask_self_label.connect(bridge.on_ask_label)
     tracker.worker.show_reminder.connect(bridge.on_show_reminder)
+    tracker.worker.ask_on_task.connect(bridge.on_ask_on_task)
+    tracker.worker.show_drift.connect(bridge.on_show_drift)
     tracker.worker.confirm_reminder.connect(bridge.on_confirm_reminder)
     tracker.worker.status.connect(bridge.on_status)
     mascot.clicked.connect(bridge.on_mascot_clicked)

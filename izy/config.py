@@ -128,6 +128,55 @@ max_defer_minutes = 60
 end_of_day_hour = 18
 
 
+# Classification. Evaluated as a ladder, stopping at the first confident
+# answer, because cost discipline is a hard requirement:
+#   tier 1  app + title vs the rules below          free
+#   tier 2  browser tab URL                         free
+#   tier 3  one LLM call, only when 1-2 are unsure  paid
+#   tier 4  ask you, one tap                        free
+[classify]
+enabled = true
+
+# Spans shorter than this are never classified. Glancing at a window for four
+# seconds is not a decision worth paying to judge.
+min_duration_s = 20
+
+# Ambiguous events are buffered for up to this long and judged several per
+# call, rather than one call each.
+batch_window_s = 60
+
+# Below this confidence Izy asks you (tier 4) instead of trusting the answer.
+confidence_threshold = 0.7
+
+# Tier 1 rules. Matching is case-insensitive substring by default; prefix an
+# entry with "re:" for a regular expression. Deny wins over allow, so listing
+# an app as off-task beats a matching on-task title.
+#
+# These are absolute judgements ("Spotify is never work"), unlike tier 3, which
+# asks whether something is plausibly related to what you *said* you are doing.
+# Most of your day should be handled here, for free — add to these lists
+# whenever tier 3 or tier 4 asks about something you consider obvious.
+on_task_apps = ["code", "kitty", "alacritty", "gnome-terminal", "jetbrains", "pycharm"]
+off_task_apps = ["spotify", "steam", "discord", "vlc"]
+on_task_titles = []
+off_task_titles = []
+
+# Tier 2. Only consulted when the focused window is a browser.
+on_task_urls = ["localhost", "github.com", "docs.python.org", "stackoverflow.com"]
+off_task_urls = ["youtube.com", "twitter.com", "x.com", "reddit.com", "instagram.com",
+                 "tiktok.com", "netflix.com", "facebook.com"]
+
+
+# Drift alerts. These ride on the interruption budget above, so they can never
+# exceed max_per_hour however much you drift.
+[drift]
+enabled = true
+
+# Alerts name what you said you were doing and what you are doing instead, and
+# nothing more: "You said: fix the dataloader. YouTube, 11 min."
+# Set false to classify silently and only see it in the retrospective.
+
+
 [mascot]
 # Which screen corner to anchor to, remembered across restarts.
 # One of: top-left, top-right, bottom-left, bottom-right
@@ -197,6 +246,32 @@ class RemindersConfig:
 
 
 @dataclass(frozen=True)
+class ClassifyConfig:
+    enabled: bool = True
+    min_duration_s: int = 20
+    batch_window_s: int = 60
+    confidence_threshold: float = 0.7
+    # Defaults deliberately mirror DEFAULT_CONFIG_TOML exactly, so a machine
+    # with no config file behaves identically to one with the shipped file.
+    # tests/test_selflabel_and_config.py asserts that round-trip.
+    on_task_apps: tuple = ("code", "kitty", "alacritty", "gnome-terminal",
+                           "jetbrains", "pycharm")
+    off_task_apps: tuple = ("spotify", "steam", "discord", "vlc")
+    on_task_titles: tuple = ()
+    off_task_titles: tuple = ()
+    on_task_urls: tuple = ("localhost", "github.com", "docs.python.org",
+                           "stackoverflow.com")
+    off_task_urls: tuple = ("youtube.com", "twitter.com", "x.com", "reddit.com",
+                            "instagram.com", "tiktok.com", "netflix.com",
+                            "facebook.com")
+
+
+@dataclass(frozen=True)
+class DriftConfig:
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
 class MascotConfig:
     corner: str = "bottom-right"
     margin_px: int = 24
@@ -213,6 +288,8 @@ class Config:
     interruptions: InterruptionConfig = field(default_factory=InterruptionConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     reminders: RemindersConfig = field(default_factory=RemindersConfig)
+    classify: ClassifyConfig = field(default_factory=ClassifyConfig)
+    drift: DriftConfig = field(default_factory=DriftConfig)
     mascot: MascotConfig = field(default_factory=MascotConfig)
 
 
@@ -223,14 +300,22 @@ _SECTIONS = {
     "interruptions": InterruptionConfig,
     "llm": LLMConfig,
     "reminders": RemindersConfig,
+    "classify": ClassifyConfig,
+    "drift": DriftConfig,
     "mascot": MascotConfig,
 }
 
 
 def _build(cls, raw: dict[str, Any]):
-    """Construct a section, ignoring unknown keys rather than crashing on a typo."""
+    """Construct a section, ignoring unknown keys rather than crashing on a typo.
+
+    TOML arrays parse as lists; the sections are frozen dataclasses compared for
+    equality in tests, so lists are normalised to tuples.
+    """
     known = {f.name for f in fields(cls)}
-    return cls(**{k: v for k, v in raw.items() if k in known})
+    values = {k: (tuple(v) if isinstance(v, list) else v)
+              for k, v in raw.items() if k in known}
+    return cls(**values)
 
 
 def load(path: Path | None = None, *, write_default: bool = True) -> Config:

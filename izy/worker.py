@@ -19,6 +19,8 @@ from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 
 from . import db
 from .budget import InterruptionBudget
+from .classifier import Classifier
+from .drift import DriftDetector
 from .llm import LLM
 from .reminders import ReminderScheduler, parse as parse_reminder
 from .reminders import store as reminder_store
@@ -38,6 +40,8 @@ class TrackerWorker(QObject):
     phase_changed = Signal(str, object)  # phase value, Session|None
     ask_self_label = Signal(int, str, str)  # event_id, app, title
     show_reminder = Signal(int, str)        # reminder_id, text
+    ask_on_task = Signal(int, str, str)     # tier 4: event_id, intent, title
+    show_drift = Signal(int, str)           # intervention_id, message
     confirm_reminder = Signal(str)          # original text we could not parse
     status = Signal(str)
 
@@ -53,6 +57,9 @@ class TrackerWorker(QObject):
         self.budget = None
         self.llm = None
         self.reminders = None
+        self.classifier = None
+        self.drift = None
+        self._last_classified_id = 0
         self._timer = None
         self._last_resync = None
         self._last_eod_check = None
@@ -73,6 +80,8 @@ class TrackerWorker(QObject):
         self.budget = InterruptionBudget(self.conn, self.cfg)
         self.llm = LLM(self.conn, self.cfg)
         self.reminders = ReminderScheduler(self.conn, self.cfg)
+        self.classifier = Classifier(self.conn, self.cfg, self.llm)
+        self.drift = DriftDetector(self.conn, self.cfg, self.budget)
 
         self.sessions.on_change(self._on_phase_change)
         self.sessions.recover()
@@ -92,6 +101,11 @@ class TrackerWorker(QObject):
             self._timer.stop()
         if self.tracker:
             self.tracker.stop()
+        if self.classifier:
+            try:
+                self._flush_classifier(force=True)
+            except Exception:
+                log.exception("final classifier flush failed")
         if self.watcher:
             self.watcher.close()
         if self.conn:
@@ -120,6 +134,59 @@ class TrackerWorker(QObject):
             self._maybe_overrun()
         self._maybe_self_label()
         self._check_reminders(snap)
+        self._classify_new_events()
+        self._check_drift()
+
+    # --- classification ----------------------------------------------------
+
+    def _classify_new_events(self) -> None:
+        """Judge spans that have closed since the last tick.
+
+        Only *closed* spans are considered: an open span's duration is still
+        growing, and judging it early would both misreport its length and waste
+        the one cached verdict it is entitled to.
+        """
+        try:
+            open_id = self.tracker.span.event_id if self.tracker.span else None
+            rows = self.conn.execute(
+                "SELECT e.*, s.declared_intent FROM activity_events e"
+                " LEFT JOIN sessions s ON s.id = e.session_id"
+                " WHERE e.id > ? AND (? IS NULL OR e.id != ?) ORDER BY e.id",
+                (self._last_classified_id, open_id, open_id)).fetchall()
+            for row in rows:
+                self._last_classified_id = max(self._last_classified_id, row["id"])
+                self.classifier.consider(row, row["declared_intent"])
+
+            if self.classifier.batch_ready():
+                self._flush_classifier()
+        except Exception:
+            log.exception("classification failed")
+
+    def _flush_classifier(self, *, force: bool = False) -> None:
+        decisions, ask = self.classifier.flush(force=force)
+        if decisions:
+            log.debug("classified %d event(s) via tier 3", len(decisions))
+        for pending in ask:
+            # Tier 4. Asking is free and honest; guessing is neither.
+            allowed, reason = self.budget.check("self_label")
+            if not allowed:
+                log.debug("tier 4 question suppressed: %s", reason)
+                break
+            self.budget.record("self_label", pending.title)
+            self.ask_on_task.emit(pending.event_id, pending.intent,
+                                  pending.title or pending.app or "that window")
+
+    def _check_drift(self) -> None:
+        try:
+            session = self.sessions.current
+            if not session:
+                return
+            result = self.drift.check(session.id, session.declared_intent)
+            if result:
+                message, intervention_id = result
+                self.show_drift.emit(intervention_id, message)
+        except Exception:
+            log.exception("drift check failed")
 
     # --- reminders ---------------------------------------------------------
 
@@ -197,6 +264,9 @@ class TrackerWorker(QObject):
 
     @Slot(str)
     def request_end_session(self, outcome: str) -> None:
+        # Settle anything buffered before the intent goes away — after the
+        # session ends there is nothing left to judge those windows against.
+        self._flush_classifier(force=True)
         self.sessions.end(outcome or None)
 
     @Slot(int, bool)
@@ -206,6 +276,16 @@ class TrackerWorker(QObject):
     @Slot()
     def request_skip_label(self) -> None:
         self.selflabel.skip()
+
+    @Slot(int, bool)
+    def request_on_task_answer(self, event_id: int, on_task: bool) -> None:
+        """Tier 4's answer. Ground truth, and it seeds the cache."""
+        self.classifier.record_user_answer(event_id, on_task)
+
+    @Slot(int, str)
+    def request_drift_response(self, intervention_id: int, response: str) -> None:
+        """A dismissal starts the 15-minute cooldown, so this has to be recorded."""
+        self.budget.resolve(intervention_id, response)
 
     @Slot(str)
     def request_add_reminder(self, raw: str) -> None:
