@@ -8,10 +8,10 @@ attention actually went.
 Personal tool, one machine, one person. Nothing leaves the machine.
 `SPEC.md` is the source of truth for scope.
 
-**Status: Phase 3 (classification) complete.** Izy logs where your attention
+**Status: Phase 4 (retrospective) complete.** Izy logs where your attention
 goes, holds reminders, judges activity against what you said you were working
-on, and says something at most rarely when you drift. Phase 4 is the
-retrospective dashboard.
+on, says something rarely when you drift, and shows you the day afterwards.
+Phase 5 is mascot art and the optional screen-capture tier.
 
 ## Install
 
@@ -57,6 +57,39 @@ bubble with done / snooze / dismiss — never modal, never focus-stealing, silen
 
 Reminders are things you asked for, so they do not consume the interruption
 budget, which is reserved for things Izy decides to say on its own.
+
+## The retrospective
+
+```bash
+izy report              # build today's dashboard and open it
+izy report yesterday
+izy report --no-serve   # just write the HTML file
+```
+
+A local HTML page — self-contained, no CDN, no fonts, no network of any kind,
+so it renders with the machine offline. It shows the day's timeline as
+on-task / off-task / break / away bands (hover for the app and window), the
+session table with planned against actual, which app pulled you out and how
+much time went with it, which hours you are weakest in (with sample sizes,
+because one bad ten-minute hour is not a pattern), the full tier 3/4
+classification audit with each decision's reason, and the day's LLM spend.
+
+It is also written automatically at the end of each day to
+`~/.local/share/izy/reports/`, quietly — nothing is opened and nothing is
+announced.
+
+**Correcting a wrong call is one click.** `izy report` serves the page from
+127.0.0.1 so the "this was wrong" buttons can write straight to `labels`; the
+server binds to loopback only and answers exactly two routes. Opened as a plain
+`file://` there is no server to talk to, so the button tells you the
+`izy relabel` command instead of failing silently.
+
+The colours are the validated categorical palette (blue / orange / aqua) checked
+against both light and dark surfaces. Away is neutral gray rather than a fourth
+hue — being away is an absence of activity, not a kind of it — which also keeps
+the palette to three hues and clear of the colour-vision floors. Aqua sits below
+3:1 on the light surface, so identity is never carried by colour alone: every
+band is named in the legend and again in the totals table.
 
 ## Classification
 

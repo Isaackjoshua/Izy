@@ -207,21 +207,24 @@ def recent_events(conn, limit: int = 50) -> list[sqlite3.Row]:
 # --- labels -----------------------------------------------------------------
 
 def add_label(conn, event_id: int, source: str, on_task: bool,
-              confidence: float | None = None, reason: str | None = None) -> int:
+              confidence: float | None = None, reason: str | None = None,
+              *, now=None) -> int:
     cur = conn.execute(
         "INSERT INTO labels(event_id, source, on_task, confidence, reason, created_at)"
         " VALUES (?,?,?,?,?,?)",
-        (event_id, source, int(on_task), confidence, reason, to_iso(utcnow())),
+        (event_id, source, int(on_task), confidence, reason, to_iso(now or utcnow())),
     )
     return cur.lastrowid
 
 
 def labels_for_day(conn, day: datetime) -> list[sqlite3.Row]:
+    """Labels on that day's *activity* — not labels written that day. A batch
+    flushed after midnight judges the previous day's windows."""
     lo, hi = _day_bounds(day)
     return conn.execute(
         "SELECT l.*, e.app, e.window_title FROM labels l"
         " JOIN activity_events e ON e.id = l.event_id"
-        " WHERE l.created_at >= ? AND l.created_at < ? ORDER BY l.created_at",
+        " WHERE e.ts >= ? AND e.ts < ? ORDER BY l.id",
         (lo, hi),
     ).fetchall()
 
@@ -250,6 +253,11 @@ def interventions_since(conn, since: datetime) -> list[sqlite3.Row]:
 
 
 # --- helpers ----------------------------------------------------------------
+
+def day_bounds(day: datetime) -> tuple[str, str]:
+    """Public alias — the report and CLI both need a day's UTC bounds."""
+    return _day_bounds(day)
+
 
 def _day_bounds(day: datetime) -> tuple[str, str]:
     """Local-calendar-day bounds, expressed as the UTC strings we store.

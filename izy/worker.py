@@ -63,6 +63,7 @@ class TrackerWorker(QObject):
         self._timer = None
         self._last_resync = None
         self._last_eod_check = None
+        self._last_report_day = None
         self._last_phase = None
         self._seen_apps: set[str] = set()
 
@@ -210,8 +211,25 @@ class TrackerWorker(QObject):
                 self._last_eod_check = self.sessions.clock()
                 for r in self.reminders.on_context("end_of_day"):
                     self._fire(r)
+                self._write_retrospective()
         except Exception:
             log.exception("reminder check failed")
+
+    def _write_retrospective(self) -> None:
+        """SPEC.md Feature 5: regenerated automatically at end of day.
+
+        Writing the file is all that happens here — nothing is opened and
+        nothing is announced. The retrospective is for when you go looking.
+        """
+        today = self.sessions.clock().astimezone().date()
+        if self._last_report_day == today:
+            return
+        self._last_report_day = today
+        try:
+            from . import report
+            report.write(self.conn, self.cfg)
+        except Exception:
+            log.exception("end-of-day retrospective failed")
 
     def _fire(self, reminder) -> None:
         self.reminders.fired(reminder.id)

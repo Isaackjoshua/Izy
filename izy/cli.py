@@ -99,10 +99,10 @@ def cmd_day(args) -> int:
 
     calls = conn.execute(
         "SELECT COUNT(*), COALESCE(SUM(cost_usd),0) FROM llm_calls"
-        " WHERE ts >= ? AND ts < ? AND cached = 0", _day_bounds_for(day)).fetchone()
+        " WHERE ts >= ? AND ts < ? AND cached = 0", db.day_bounds(day)).fetchone()
     cached = conn.execute(
         "SELECT COUNT(*) FROM llm_calls WHERE ts >= ? AND ts < ? AND cached = 1",
-        _day_bounds_for(day)).fetchone()[0]
+        db.day_bounds(day)).fetchone()[0]
     print(f"\nLLM  {calls[0]} paid call(s), ${calls[1]:.4f}, {cached} cache hit(s)")
 
     by_source: dict[str, int] = {}
@@ -146,6 +146,36 @@ def cmd_day(args) -> int:
             mark = "on-task " if l["on_task"] else "off-task"
             print(f"  {_local(l['created_at'])}  {mark}  [{l['source']}]  "
                   f"{(l['window_title'] or l['app'] or '')[:56]}")
+    return 0
+
+
+def cmd_report(args) -> int:
+    """Build the day's retrospective and open it.
+
+    Served from localhost by default so the "this was wrong" buttons can write
+    back; --no-serve just writes the file for later.
+    """
+    from . import report as report_mod
+    from .report.serve import ReportServer
+
+    cfg = config.load()
+    conn = db.connect()
+    day = _parse_day(args.date)
+    path = report_mod.write(conn, cfg, day)
+    conn.close()
+    print(f"wrote {path}")
+
+    if args.no_serve:
+        print(f"open it with:  xdg-open {path}")
+        return 0
+
+    server = ReportServer(db.connect, cfg, day)
+    url = server.url
+    print(f"serving at {url}   (ctrl-c to stop)")
+    if not args.no_open:
+        import webbrowser
+        webbrowser.open(url)
+    server.serve_forever()
     return 0
 
 
@@ -341,11 +371,6 @@ def cmd_stop(args) -> int:
     return 0
 
 
-def _day_bounds_for(day):
-    from .db import _day_bounds
-    return _day_bounds(day)
-
-
 def _env(name: str) -> str:
     return os.environ.get(name) or "(unset)"
 
@@ -381,6 +406,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("stop", help="end the open focus session")
     sp.add_argument("outcome", nargs="?", choices=["finished", "partly", "no"])
     sp.set_defaults(func=cmd_stop)
+
+    rep = sub.add_parser("report", help="build and open the day's retrospective")
+    rep.add_argument("date", nargs="?", default="today",
+                     help="today | yesterday | YYYY-MM-DD")
+    rep.add_argument("--no-serve", action="store_true",
+                     help="just write the HTML file; corrections then need izy relabel")
+    rep.add_argument("--no-open", action="store_true",
+                     help="serve but do not launch a browser")
+    rep.set_defaults(func=cmd_report)
 
     rel = sub.add_parser("relabel", help="correct a classification")
     rel.add_argument("event_id", type=int)
