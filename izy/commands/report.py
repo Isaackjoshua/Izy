@@ -10,7 +10,7 @@ def cmd_report(args) -> int:
     Served from localhost by default so the "this was wrong" buttons can write
     back; --no-serve just writes the file for later.
     """
-    from . import report as report_mod
+    from .. import report as report_mod
     from ..report.serve import ReportServer
 
     cfg = config.load()

@@ -16,7 +16,7 @@ def cmd_doctor(args) -> int:
     thing to try when titles stop showing up."""
     from ..watchers import pick_watcher
     from ..watchers.native import IZY_DEST
-    from . import dbus
+    from .. import dbus
 
     cfg = config.load()
     print(f"session type   : {_env('XDG_SESSION_TYPE')}")

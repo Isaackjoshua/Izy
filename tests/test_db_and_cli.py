@@ -111,3 +111,31 @@ def test_cli_day_shows_sessions_and_app_totals(capsys, tmp_path, monkeypatch, cl
     out = capsys.readouterr().out
     assert "fix the dataloader" in out
     assert "code" in out and "main.py" in out
+
+
+# --- every command is at least reachable ------------------------------------
+
+@pytest.mark.parametrize("argv", [
+    ["day"], ["day", "-v"], ["day", "--json"], ["status"], ["reminders"],
+    ["doctor"], ["report", "--no-serve"],
+])
+def test_every_read_only_command_runs(argv, capsys, tmp_path, monkeypatch):
+    """Splitting cli.py into izy/commands/ left two commands importing the
+    wrong package level — `izy doctor` raised ImportError and `izy report`
+    imported itself. Both passed every existing test, because nothing invoked
+    them. This is that missing test."""
+    monkeypatch.setenv("IZY_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("IZY_CONFIG_DIR", str(tmp_path / "cfg"))
+    monkeypatch.setenv("IZY_STATE_DIR", str(tmp_path / "state"))
+    # doctor exits non-zero when nothing can be polled; that is a valid answer,
+    # not a crash. Anything raising is the failure this test is looking for.
+    rc = cli.main(argv)
+    assert rc in (0, 1)
+
+
+def test_the_parser_exposes_every_command():
+    parser = cli.build_parser()
+    actions = [a for a in parser._actions if hasattr(a, "choices") and a.choices]
+    names = set(actions[0].choices)
+    assert {"day", "report", "relabel", "remind", "reminders", "status",
+            "start", "stop", "doctor", "install-extension", "run"} <= names
