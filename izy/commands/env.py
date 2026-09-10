@@ -44,6 +44,9 @@ def cmd_doctor(args) -> int:
     key = "set" if os.environ.get("ANTHROPIC_API_KEY") else "not set"
     print(f"ANTHROPIC_API_KEY: {key} (llm enabled={cfg.llm.enabled})")
 
+    from ..capture import describe as describe_capture
+    print(f"screen capture : {describe_capture(cfg)}")
+
     watcher = pick_watcher(cfg.watcher)
     describe = getattr(watcher, "describe", None)
     print(f"chosen watcher : {describe() if describe else watcher.name}")

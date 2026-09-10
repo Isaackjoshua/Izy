@@ -39,6 +39,8 @@ REMINDER = "reminder"           # (reminder_id, text)
 CONFIRM_REMINDER = "confirm"    # (raw_text,)
 ASK_ON_TASK = "ask_on_task"     # (event_id, intent, what)
 DRIFT = "drift"                 # (intervention_id, message)
+MASCOT = "mascot"               # (state,) — neutral | soft-alert | asleep
+ASK_OUTCOME = "ask_outcome"     # (session_id, intent)
 STATUS = "status"               # (message,)
 
 
@@ -84,6 +86,7 @@ class Pipeline:
         self._last_phase = None
         self._last_classified_id = 0
         self._seen_apps: set[str] = set()
+        self._mascot_state = None
 
         self.sessions.on_change(self._on_phase_change)
 
@@ -129,6 +132,7 @@ class Pipeline:
         self._check_reminders(snap)
         self._classify_new_events()
         self._check_drift()
+        self._update_mascot()
         return self._drain()
 
     def _drain(self) -> list[Event]:
@@ -137,6 +141,34 @@ class Pipeline:
 
     def _emit(self, kind: str, *payload) -> None:
         self._out.append(Event(kind, payload))
+
+    # --- mascot ------------------------------------------------------------
+
+    def mascot_state(self) -> str:
+        """asleep off a session, soft-alert while drifting, neutral otherwise.
+
+        Derived every tick rather than set at the moment of an alert. Setting it
+        on the alert alone left no way back: the mascot went orange when you
+        drifted and stayed orange, because nothing was watching for you
+        returning to the task.
+        """
+        session = self.sessions.current
+        if not session or self.sessions.phase is not Phase.FOCUS:
+            return "asleep"
+        state = self.drift.state(session.id)
+        if self.budget.drift_qualifies(state.off_task_minutes):
+            return "soft-alert"
+        return "neutral"
+
+    def _update_mascot(self) -> None:
+        try:
+            state = self.mascot_state()
+        except Exception:
+            log.exception("mascot state failed")
+            return
+        if state != self._mascot_state:
+            self._mascot_state = state
+            self._emit(MASCOT, state)
 
     # --- sessions ----------------------------------------------------------
 
@@ -167,15 +199,26 @@ class Pipeline:
             except Exception:
                 log.exception("reminder phase hook failed")
         self._emit(PHASE, phase.value, session)
+        self._update_mascot()
 
     def _maybe_overrun(self) -> None:
+        """The planned time is up. SPEC.md Feature 1: session end asks how it
+        went — finished / partly / no.
+
+        The question still goes through the interruption budget, so a day that
+        has already spent its allowance ends the session quietly instead and
+        the outcome is asked the next time you click the mascot. Ending it is
+        not conditional on being allowed to ask.
+        """
+        session = self.sessions.current
         allowed, reason = self.budget.check("session_overrun")
-        if not allowed:
-            log.debug("overrun notice suppressed: %s", reason)
-            return
-        # Closed quietly rather than nagged about; the outcome prompt is asked
-        # the next time the mascot is clicked.
+        self._flush_classifier(force=True)
         self.sessions.end(None)
+        if not allowed:
+            log.debug("outcome prompt suppressed: %s", reason)
+            return
+        self.budget.record("session_overrun", session.declared_intent)
+        self._emit(ASK_OUTCOME, session.id, session.declared_intent)
 
     # --- self-label --------------------------------------------------------
 
@@ -304,6 +347,14 @@ class Pipeline:
         self._flush_classifier(force=True)
         self.sessions.end(outcome or None)
         return self._drain()
+
+    def record_outcome(self, session_id: int, outcome: str) -> None:
+        """Answer the outcome question after the fact — by the time it is
+        answered the session is already closed."""
+        try:
+            self.sessions.record_outcome(session_id, outcome)
+        except ValueError as e:
+            log.warning("ignoring bad outcome: %s", e)
 
     def record_self_label(self, event_id: int, on_task: bool) -> None:
         self.selflabel.record(event_id, on_task)

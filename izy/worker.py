@@ -36,6 +36,8 @@ class TrackerWorker(QObject):
     ask_on_task = Signal(int, str, str)     # tier 4: event_id, intent, what
     show_drift = Signal(int, str)           # intervention_id, message
     confirm_reminder = Signal(str)          # text we could not parse
+    mascot_state = Signal(str)              # neutral | soft-alert | asleep
+    ask_outcome = Signal(int, str)          # session_id, intent
     status = Signal(str)
 
     def __init__(self, cfg, db_path=None) -> None:
@@ -89,6 +91,8 @@ class TrackerWorker(QObject):
         pl.CONFIRM_REMINDER: "confirm_reminder",
         pl.ASK_ON_TASK: "ask_on_task",
         pl.DRIFT: "show_drift",
+        pl.MASCOT: "mascot_state",
+        pl.ASK_OUTCOME: "ask_outcome",
         pl.STATUS: "status",
     }
 
@@ -101,6 +105,10 @@ class TrackerWorker(QObject):
     @Slot(str)
     def request_end_session(self, outcome: str) -> None:
         self._dispatch(self.pipeline.end_session(outcome or None))
+
+    @Slot(int, str)
+    def request_outcome(self, session_id: int, outcome: str) -> None:
+        self.pipeline.record_outcome(session_id, outcome)
 
     @Slot(int, bool)
     def request_label(self, event_id: int, on_task: bool) -> None:

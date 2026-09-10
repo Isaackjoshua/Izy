@@ -96,8 +96,21 @@ def _build_bridge():
 
         @Slot(str, object)
         def on_phase(self, phase_value: str, session) -> None:
-            self.mascot.set_state(
-                "neutral" if phase_value == Phase.FOCUS.value else "asleep")
+            """Phase changes no longer drive the mascot — the pipeline derives
+            its state every tick and sends it, so drifting has a way back."""
+
+        @Slot(str)
+        def on_mascot_state(self, state: str) -> None:
+            self.mascot.set_state(state)
+
+        @Slot(int, str)
+        def on_ask_outcome(self, session_id: int, intent: str) -> None:
+            """The planned time is up — SPEC.md Feature 1 asks how it went."""
+            from .ui.prompts import OutcomePrompt
+            p = self._keep(OutcomePrompt(intent))
+            p.chosen.connect(
+                lambda outcome: self.worker.request_outcome(session_id, outcome))
+            self._place(p)
 
         @Slot(int, str, str)
         def on_ask_label(self, event_id: int, app_name: str, title: str) -> None:
@@ -153,7 +166,6 @@ def _build_bridge():
                 lambda: self.worker.request_drift_response(intervention_id,
                                                            "dismissed"))
             self._place(a)
-            self.mascot.set_state("soft-alert")
 
         @Slot(str)
         def on_status(self, msg: str) -> None:
@@ -210,6 +222,8 @@ def run(argv: list[str] | None = None) -> int:
     tracker.worker.show_reminder.connect(bridge.on_show_reminder)
     tracker.worker.ask_on_task.connect(bridge.on_ask_on_task)
     tracker.worker.show_drift.connect(bridge.on_show_drift)
+    tracker.worker.mascot_state.connect(bridge.on_mascot_state)
+    tracker.worker.ask_outcome.connect(bridge.on_ask_outcome)
     tracker.worker.confirm_reminder.connect(bridge.on_confirm_reminder)
     tracker.worker.status.connect(bridge.on_status)
     mascot.clicked.connect(bridge.on_mascot_clicked)

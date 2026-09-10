@@ -177,6 +177,28 @@ enabled = true
 # Set false to classify silently and only see it in the retrospective.
 
 
+# Screen capture. Off by default, and it should probably stay that way.
+#
+# When enabled, Izy may photograph the focused window to help judge an
+# otherwise ambiguous one, and that image is sent to the LLM. The blocklist
+# below is checked BEFORE any capture happens, so a blocked window's pixels are
+# never read at all — not read and discarded, never read.
+#
+# On GNOME/Wayland there is no silent capture route: the shell's screenshot
+# D-Bus method is AccessDenied and the only alternative is the desktop portal,
+# which asks you every time. In practice that makes this tier impractical here,
+# which for a feature like this is a reasonable place to land.
+[capture]
+enabled = false
+
+# Matched case-insensitively as substrings against the app and the window
+# title; prefix an entry with "re:" for a regular expression. Leave the list
+# empty to use the built-in default, which covers password managers, banking,
+# private browsing and messaging. Add to it freely — a missed capture only
+# costs one extra question.
+blocklist = []
+
+
 [mascot]
 # Which screen corner to anchor to, remembered across restarts.
 # One of: top-left, top-right, bottom-left, bottom-right
@@ -272,6 +294,12 @@ class DriftConfig:
 
 
 @dataclass(frozen=True)
+class CaptureConfig:
+    enabled: bool = False
+    blocklist: tuple = ()
+
+
+@dataclass(frozen=True)
 class MascotConfig:
     corner: str = "bottom-right"
     margin_px: int = 24
@@ -290,6 +318,7 @@ class Config:
     reminders: RemindersConfig = field(default_factory=RemindersConfig)
     classify: ClassifyConfig = field(default_factory=ClassifyConfig)
     drift: DriftConfig = field(default_factory=DriftConfig)
+    capture: CaptureConfig = field(default_factory=CaptureConfig)
     mascot: MascotConfig = field(default_factory=MascotConfig)
 
 
@@ -302,6 +331,7 @@ _SECTIONS = {
     "reminders": RemindersConfig,
     "classify": ClassifyConfig,
     "drift": DriftConfig,
+    "capture": CaptureConfig,
     "mascot": MascotConfig,
 }
 

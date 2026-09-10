@@ -8,10 +8,9 @@ attention actually went.
 Personal tool, one machine, one person. Nothing leaves the machine.
 `SPEC.md` is the source of truth for scope.
 
-**Status: Phase 4 (retrospective) complete.** Izy logs where your attention
-goes, holds reminders, judges activity against what you said you were working
-on, says something rarely when you drift, and shows you the day afterwards.
-Phase 5 is mascot art and the optional screen-capture tier.
+**Status: all five phases complete.** Izy logs where your attention goes, holds
+reminders, judges activity against what you said you were working on, says
+something rarely when you drift, and shows you the day afterwards.
 
 ## Install
 
@@ -180,6 +179,44 @@ requested whether or not the compositor honoured it. Verified against the X
 server instead of Qt's cache, XWayland positions correctly and native Wayland
 does not, so `izy.service` sets `QT_QPA_PLATFORM=xcb`. Override with `IZY_QPA`.
 
+## The mascot
+
+Three static postures in `izy/ui/art.py`, drawn as SVG so they stay crisp at any
+scale and ship as code rather than a folder of PNGs:
+
+| State | When | How it reads |
+|---|---|---|
+| asleep | no session | squat, gray, eyes closed — present but not watching |
+| neutral | session running, on task | upright, blue, looking ahead |
+| soft-alert | drifting | leaning away, orange, glancing to the side |
+
+Posture carries the state, not just colour, so it stays legible to someone who
+cannot distinguish the hues — and the drifting posture looks *away* rather than
+disappointed, because off-task is not a moral failure.
+
+**There is no idle animation of any kind.** The only motion the mascot ever
+makes is a 400ms cross-fade when its state genuinely changes. The state is
+derived every tick from whether you are drifting, so returning to the task
+clears it — an earlier version set it when an alert fired and had no way back.
+
+## Screen capture (off by default)
+
+Phase 5's optional tier, and it ships disabled.
+
+When enabled, Izy may photograph the focused window to judge an ambiguous one,
+and that image goes to the LLM. The blocklist is checked **before** any capture
+happens, so a blocked window's pixels are never read at all — not read and
+discarded, *never read*. It fails closed: a window it cannot identify is
+refused. The shipped list covers password managers, banking, private browsing
+and messaging, and it never photographs Izy's own prompts.
+
+**On GNOME/Wayland there is no silent capture route, and Izy does not pretend
+otherwise.** Measured on this machine: `org.gnome.Shell.Screenshot` returns
+`AccessDenied`, no screenshot CLI tool is installed, and the only remaining
+route is the XDG desktop portal, which prompts every time. That makes this tier
+impractical for continuous background use here — which, for a feature like
+this, is a reasonable place to land. `izy doctor` reports the status.
+
 ## Design commitments
 
 These are load-bearing, not stylistic:
@@ -216,8 +253,11 @@ izy/
   reminders/   natural-language parsing, storage, firing rules
   selflabel.py the hourly "were you on task?" policy
   worker.py    the tracking thread
-  ui/          mascot overlay + popups
-  cli.py       izy day / status / doctor / start / stop
+  ui/          mascot overlay, art, popups
+  pipeline.py  the whole tick policy, with no Qt in it
+  capture.py   the screen-capture gate (off by default)
+  commands/    one module per group of CLI commands
+  cli.py       argparse wiring, and nothing else
 gnome-extension/izy@local/   the focus reporter
 packaging/                   systemd unit + installer
 ```

@@ -1,6 +1,7 @@
-"""The mascot overlay. Phase 1 ships the static placeholder square SPEC.md asks
-for — real art is Phase 5 — but the *behaviour* is built to spec now, because
-that is the part that decides whether this thing survives a week of use.
+"""The mascot overlay.
+
+The art lives in `art.py` as three static SVG postures; this widget rasterises
+them at the screen's pixel ratio and cross-fades between them.
 
 Non-negotiables implemented here:
   * No idle animation. None. Motion in peripheral vision is what steals
@@ -15,19 +16,35 @@ implement layer-shell. See docs/STEP0-ENVIRONMENT.md.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QPoint, QPropertyAnimation, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QCursor, QPainter
+from PySide6.QtCore import QPoint, QPropertyAnimation, QRectF, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QCursor, QPainter, QPixmap
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import QWidget
+
+from . import art
 
 W, H = 48, 56
 FADE_MS = 400  # cross-fade only; nothing else in this widget moves
+FADE_STEPS = 20
 
 # neutral (on task) / soft-alert (drifting) / asleep (no session)
 STATE_COLORS = {
-    "neutral": QColor(96, 140, 220),
-    "soft-alert": QColor(214, 158, 92),
-    "asleep": QColor(120, 124, 134),
+    "neutral": QColor(61, 127, 214),
+    "soft-alert": QColor(224, 128, 60),
+    "asleep": QColor(124, 122, 116),
 }
+
+
+def _render(state: str, scale: float) -> QPixmap:
+    """Rasterise one posture at the screen's device pixel ratio."""
+    pixmap = QPixmap(int(W * scale), int(H * scale))
+    pixmap.setDevicePixelRatio(scale)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+    QSvgRenderer(art.svg_for(state).encode()).render(painter, QRectF(0, 0, W, H))
+    painter.end()
+    return pixmap
 
 
 class Mascot(QWidget):
@@ -37,8 +54,10 @@ class Mascot(QWidget):
         super().__init__(None)
         self.cfg = cfg
         self._state = "asleep"
-        self._color = QColor(STATE_COLORS["asleep"])
-        self._target = QColor(STATE_COLORS["asleep"])
+        self._scale = 1.0
+        self._pixmaps: dict[str, QPixmap] = {}
+        self._from_pixmap = None
+        self._fade = 1.0     # 1.0 == the current state is fully drawn
         self._fade_step = 0
         # None means "not applied yet", so the first call always writes the
         # attribute. Tracking it as a plain bool starting at False made the
@@ -68,7 +87,7 @@ class Mascot(QWidget):
         self._cursor_timer.start()
 
         self._fade_timer = QTimer(self)
-        self._fade_timer.setInterval(FADE_MS // 20)
+        self._fade_timer.setInterval(FADE_MS // FADE_STEPS)
         self._fade_timer.timeout.connect(self._advance_fade)
 
         self._opacity_anim = QPropertyAnimation(self, b"windowOpacity", self)
@@ -92,20 +111,31 @@ class Mascot(QWidget):
 
     # --- state -------------------------------------------------------------
 
+    def _pixmap(self, state: str) -> QPixmap:
+        scale = self.devicePixelRatioF() or 1.0
+        if scale != self._scale:
+            self._pixmaps.clear()
+            self._scale = scale
+        if state not in self._pixmaps:
+            self._pixmaps[state] = _render(state, scale)
+        return self._pixmaps[state]
+
     def set_state(self, state: str) -> None:
-        if state not in STATE_COLORS or state == self._state:
+        """Cross-fade to another posture. Unknown states are ignored."""
+        if state not in art.STATES or state == self._state:
             return
+        self._from_pixmap = self._pixmap(self._state)
         self._state = state
-        self._target = QColor(STATE_COLORS[state])
+        self._fade = 0.0
         self._fade_step = 0
         self._fade_timer.start()
 
     def _advance_fade(self) -> None:
         self._fade_step += 1
-        t = min(1.0, self._fade_step / 20)
-        self._color = _blend(self._color, self._target, t)
-        if t >= 1.0:
+        self._fade = min(1.0, self._fade_step / FADE_STEPS)
+        if self._fade >= 1.0:
             self._fade_timer.stop()
+            self._from_pixmap = None
         self.update()
 
     # --- interaction -------------------------------------------------------
@@ -151,17 +181,14 @@ class Mascot(QWidget):
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        p.setPen(Qt.NoPen)
-        p.setBrush(self._color)
-        p.drawRoundedRect(self.rect().adjusted(2, 2, -2, -2), 12, 12)
-        # Placeholder marker so it is obvious this is not the real mascot yet.
-        p.setBrush(QColor(255, 255, 255, 70))
-        p.drawRoundedRect(self.rect().adjusted(14, 18, -14, -22), 3, 3)
-
-
-def _blend(a: QColor, b: QColor, t: float) -> QColor:
-    return QColor(
-        int(a.red() + (b.red() - a.red()) * t),
-        int(a.green() + (b.green() - a.green()) * t),
-        int(a.blue() + (b.blue() - a.blue()) * t),
-    )
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        target = QRectF(0, 0, W, H)
+        # Cross-fade by drawing the outgoing posture under the incoming one.
+        # Two static drawings and an opacity ramp — no tweened geometry, so
+        # there is nothing here that could read as idle motion.
+        if self._from_pixmap is not None and self._fade < 1.0:
+            p.setOpacity(1.0 - self._fade)
+            p.drawPixmap(target, self._from_pixmap, QRectF(self._from_pixmap.rect()))
+        current = self._pixmap(self._state)
+        p.setOpacity(self._fade if self._from_pixmap is not None else 1.0)
+        p.drawPixmap(target, current, QRectF(current.rect()))
