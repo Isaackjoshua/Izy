@@ -8,10 +8,10 @@ attention actually went.
 Personal tool, one machine, one person. Nothing leaves the machine.
 `SPEC.md` is the source of truth for scope.
 
-**Status: Phase 1 (skeleton + logging).** No LLM calls anywhere in the codebase
-yet, and no classification — Phase 1 records what happened and asks you once an
-hour whether it was on task, so the `labels` table has real examples in it
-before the classifier is written.
+**Status: Phase 2 (reminders) complete.** Phase 1 records what happened and asks
+once an hour whether it was on task, so the `labels` table has real examples in
+it before the classifier is written. Phase 2 adds reminders in natural language.
+There is still no classification — that is Phase 3.
 
 ## Install
 
@@ -23,10 +23,48 @@ Then **log out and back in, once**. That step is not optional on GNOME/Wayland
 — see below.
 
 ```bash
-izy doctor     # confirms window titles are actually readable
-izy status     # what Izy is tracking right now
-izy day -v     # the day's log
+izy doctor      # confirms window titles are actually readable
+izy status      # what Izy is tracking right now
+izy day -v      # the day's log, including LLM spend
+izy remind me to email the supervisor at 4pm
+izy reminders   # what is pending
 ```
+
+## Reminders
+
+Tell Izy something and it hands it back at the right moment. Type it into the
+mascot's box prefixed with "remind me", or use the CLI:
+
+```
+remind me to email the supervisor at 4pm
+remind me in 20 minutes to check the training run
+remind me next time I take a break to refill water
+remind me when this session ends to push the branch
+remind me next time I open slack to reply to the PR thread
+```
+
+Parsing is a ladder, cheapest first: rules for context triggers, `dateparser`
+for times, and only then a single LLM call. **It never invents a time that you
+did not state** — if nothing is readable it asks, and a budget refusal asks too
+rather than degrading to a guess. In practice every example above parses for
+free, with no API call at all.
+
+A reminder that comes due mid-session is **held until the next natural
+boundary** (session end or break), because a reminder that breaks the focus it
+exists to protect is a bug. Mark one urgent to override that. Held reminders are
+released anyway once they are `max_defer_minutes` overdue. Firing shows a small
+bubble with done / snooze / dismiss — never modal, never focus-stealing, silent.
+
+Reminders are things you asked for, so they do not consume the interruption
+budget, which is reserved for things Izy decides to say on its own.
+
+## LLM calls
+
+Every LLM call in the codebase goes through `izy/llm.py`, which enforces
+caching, an hourly and a daily call ceiling, and logs every call with its token
+count and cost — visible in `izy day`. `tests/test_llm.py` asserts by source
+scan that no other module reaches the API. With no `ANTHROPIC_API_KEY` set,
+Izy still runs; it just asks you instead of guessing.
 
 ## The one prerequisite: a GNOME shell extension
 
@@ -90,6 +128,8 @@ izy/
   tracker.py   snapshots -> coalesced activity spans (pure, no Qt)
   sessions.py  focus sessions, breaks, restart recovery
   budget.py    interruption budget enforcement
+  llm.py       the ONLY module that talks to the Anthropic API
+  reminders/   natural-language parsing, storage, firing rules
   selflabel.py the hourly "were you on task?" policy
   worker.py    the tracking thread
   ui/          mascot overlay + popups
@@ -102,6 +142,11 @@ Threading: one process. Qt owns the main thread; one worker thread does watcher
 polls and SQLite writes and talks to the UI only through Qt signals, so a hung
 D-Bus call cannot stutter the mascot. The SQLite connection is created on the
 worker thread and never touched from the UI thread.
+
+Every worker signal is received by the `UiBridge` QObject in `app.py`. That is
+load-bearing, not tidiness: Qt picks a slot's thread from the *receiver's*
+affinity, and a plain Python function has none, so connecting to bare functions
+ran UI code on the worker thread and segfaulted the daemon.
 
 ## Tests
 

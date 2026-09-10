@@ -11,10 +11,15 @@ language, no exclamation marks, no emoji, no motivational filler.
 """
 from __future__ import annotations
 
+import re
+
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit,
                                QPushButton, QSpinBox, QVBoxLayout, QWidget)
+
+#: "remind me ..." in the intent box means a reminder, not a session intent.
+_REMIND = re.compile(r"^\s*remind\s+me\b", re.I)
 
 _STYLE = """
 QFrame#card {
@@ -92,6 +97,9 @@ class IntentPrompt(Popup):
     mascot, so it is allowed to take focus — you asked for the caret."""
 
     submitted = Signal(str, int)
+    #: Same box, prefixed input — SPEC.md Feature 3 puts reminders here rather
+    #: than behind a second piece of UI to open.
+    reminder = Signal(str)
 
     def __init__(self, default_minutes: int) -> None:
         super().__init__(focusable=True)
@@ -101,7 +109,7 @@ class IntentPrompt(Popup):
 
         self.edit = QLineEdit()
         self.edit.setMinimumWidth(320)
-        self.edit.setPlaceholderText("fix the dataloader")
+        self.edit.setPlaceholderText("fix the dataloader  ·  or: remind me to …")
         self.body.addWidget(self.edit)
 
         row = QHBoxLayout()
@@ -128,7 +136,10 @@ class IntentPrompt(Popup):
         if not text:
             self.edit.setPlaceholderText("say what you are working on")
             return
-        self.submitted.emit(text, self.spin.value())
+        if _REMIND.match(text):
+            self.reminder.emit(text)
+        else:
+            self.submitted.emit(text, self.spin.value())
         self.close()
 
     def showEvent(self, e):
@@ -183,3 +194,73 @@ class SelfLabelPrompt(Popup):
 def _ellipsize(s: str, limit: int = 64) -> str:
     s = " ".join((s or "").split())
     return s if len(s) <= limit else s[: limit - 1] + "…"
+
+
+class ReminderBubble(Popup):
+    """A due reminder. Three actions, never modal, never focus-stealing, and
+    silent — SPEC.md: no sound by default.
+
+    You asked for this reminder, so it does not consume the interruption
+    budget; but it still must not be able to interrupt what you are typing.
+    """
+
+    done = Signal()
+    snoozed = Signal()
+    dismissed_reminder = Signal()
+
+    def __init__(self, text: str, snooze_minutes: int = 10) -> None:
+        super().__init__(focusable=False)
+        label = QLabel(_ellipsize(text, 80))
+        label.setWordWrap(True)
+        f = QFont(); f.setPointSize(11); label.setFont(f)
+        self.body.addWidget(label)
+
+        row = QHBoxLayout(); row.setSpacing(6)
+        done = QPushButton("Done"); done.setObjectName("primary")
+        snooze = QPushButton(f"Snooze {snooze_minutes}m")
+        dismiss = QPushButton("Dismiss")
+        done.clicked.connect(lambda: (self.done.emit(), self.close()))
+        snooze.clicked.connect(lambda: (self.snoozed.emit(), self.close()))
+        dismiss.clicked.connect(lambda: (self.dismissed_reminder.emit(), self.close()))
+        row.addWidget(done); row.addWidget(snooze); row.addStretch(1); row.addWidget(dismiss)
+        self.body.addLayout(row)
+
+
+class ConfirmReminderPrompt(Popup):
+    """Shown when nothing could be parsed. SPEC.md forbids inventing a time, so
+    this asks rather than guessing."""
+
+    submitted = Signal(str)
+
+    def __init__(self, original: str) -> None:
+        super().__init__(focusable=True)
+        self.body.addWidget(QLabel(_ellipsize(f"Could not read a time in: {original}", 72)))
+        hint = QLabel("When should this fire?"); hint.setObjectName("dim")
+        self.body.addWidget(hint)
+
+        self.edit = QLineEdit()
+        self.edit.setMinimumWidth(300)
+        self.edit.setPlaceholderText("in 20 minutes / at 4pm / on my next break")
+        self.body.addWidget(self.edit)
+
+        row = QHBoxLayout(); row.setSpacing(6)
+        row.addStretch(1)
+        cancel = QPushButton("Cancel")
+        save = QPushButton("Save"); save.setObjectName("primary"); save.setDefault(True)
+        row.addWidget(cancel); row.addWidget(save)
+        self.body.addLayout(row)
+
+        save.clicked.connect(self._submit)
+        self.edit.returnPressed.connect(self._submit)
+        cancel.clicked.connect(lambda: (self.dismissed.emit(), self.close()))
+
+    def _submit(self) -> None:
+        text = self.edit.text().strip()
+        if not text:
+            return
+        self.submitted.emit(text)
+        self.close()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self.edit.setFocus()

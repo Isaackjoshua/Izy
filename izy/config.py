@@ -87,6 +87,47 @@ cooldown_after_dismiss_minutes = 15
 deep_work_protect_minutes = 20
 
 
+# LLM. Every call in Izy goes through izy/llm.py, which enforces these.
+# Nothing is sent anywhere unless a call actually happens, and Phase 2 only
+# calls out when dateparser cannot understand a reminder you typed.
+[llm]
+# Set false to disable LLM calls entirely. Izy still works — it just asks you
+# instead of guessing when it cannot parse something.
+enabled = true
+
+# Needs ANTHROPIC_API_KEY in the environment. No key means no calls, and Izy
+# degrades to asking rather than failing.
+model = "claude-opus-5"
+
+# Thinking depth. Reminder parsing is a small extraction task, so "low" is
+# plenty; raise it only if you see parses going wrong.
+effort = "low"
+max_tokens = 1024
+
+# Hard call ceilings, deliberately low. On exceeding these Izy asks you rather
+# than degrading to a guess. Cache hits are free and are not counted.
+max_calls_per_hour = 10
+max_calls_per_day = 50
+
+
+[reminders]
+# Minutes a "snooze" defers a reminder by.
+snooze_minutes = 10
+
+# A reminder that fires during a focus session breaks the focus it is supposed
+# to protect. Non-urgent reminders that come due mid-session are therefore held
+# until the next natural boundary (session end or break). Set false to have
+# them fire immediately regardless — not recommended.
+defer_during_focus = true
+
+# How long past its due time a held reminder still fires. Beyond this it is
+# stale and fires at the next boundary anyway rather than being dropped.
+max_defer_minutes = 60
+
+# The hour "end_of_day" context reminders fire at (24h clock, local).
+end_of_day_hour = 18
+
+
 [mascot]
 # Which screen corner to anchor to, remembered across restarts.
 # One of: top-left, top-right, bottom-left, bottom-right
@@ -138,6 +179,24 @@ class InterruptionConfig:
 
 
 @dataclass(frozen=True)
+class LLMConfig:
+    enabled: bool = True
+    model: str = "claude-opus-5"
+    effort: str = "low"
+    max_tokens: int = 1024
+    max_calls_per_hour: int = 10
+    max_calls_per_day: int = 50
+
+
+@dataclass(frozen=True)
+class RemindersConfig:
+    snooze_minutes: int = 10
+    defer_during_focus: bool = True
+    max_defer_minutes: int = 60
+    end_of_day_hour: int = 18
+
+
+@dataclass(frozen=True)
 class MascotConfig:
     corner: str = "bottom-right"
     margin_px: int = 24
@@ -152,6 +211,8 @@ class Config:
     session: SessionConfig = field(default_factory=SessionConfig)
     self_label: SelfLabelConfig = field(default_factory=SelfLabelConfig)
     interruptions: InterruptionConfig = field(default_factory=InterruptionConfig)
+    llm: LLMConfig = field(default_factory=LLMConfig)
+    reminders: RemindersConfig = field(default_factory=RemindersConfig)
     mascot: MascotConfig = field(default_factory=MascotConfig)
 
 
@@ -160,6 +221,8 @@ _SECTIONS = {
     "session": SessionConfig,
     "self_label": SelfLabelConfig,
     "interruptions": InterruptionConfig,
+    "llm": LLMConfig,
+    "reminders": RemindersConfig,
     "mascot": MascotConfig,
 }
 

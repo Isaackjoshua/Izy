@@ -146,6 +146,14 @@ class SessionManager:
         self.current = row
         if row is not None:
             self.break_until = None
+        elif mine is not None:
+            # A session we were tracking just ended somewhere else (`izy stop`,
+            # or the mascot in another process). Observing that has to start a
+            # break here too, exactly as ending it ourselves would: break state
+            # lives in memory, so without this the daemon goes straight from
+            # FOCUS to IDLE and every on_break reminder is silently skipped.
+            self.break_until = self.clock() + timedelta(
+                minutes=self.cfg.session.break_minutes)
         log.info("session state resynced from db: %s -> %s", mine, theirs)
         self._notify()
         return True

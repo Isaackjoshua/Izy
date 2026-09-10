@@ -112,7 +112,10 @@ def test_resync_notices_a_session_stopped_by_the_cli(conn, cfg, clock):
     db.end_session(conn, s.id, "finished", now=clock())   # `izy stop` elsewhere
 
     assert sm.resync() is True
-    assert sm.phase is Phase.IDLE
+    assert sm.current is None
+    # A break follows an ended session however it was ended; see
+    # test_resync_starts_a_break_when_a_session_ends_elsewhere.
+    assert sm.phase is Phase.BREAK
 
 
 def test_resync_is_a_no_op_when_nothing_changed(conn, cfg, clock):
@@ -123,3 +126,24 @@ def test_resync_is_a_no_op_when_nothing_changed(conn, cfg, clock):
     sm.on_change(lambda p, s: changes.append(p))
     assert sm.resync() is False
     assert changes == [], "a steady state must not churn tracker span boundaries"
+
+
+def test_resync_starts_a_break_when_a_session_ends_elsewhere(conn, cfg, clock):
+    """Break state is in memory, so a session ended by `izy stop` in another
+    process must still put the daemon into BREAK — otherwise it jumps straight
+    to IDLE and every on_break reminder is skipped."""
+    sm = SessionManager(conn, cfg, clock=clock)
+    s = sm.start("fix the dataloader")
+    db.end_session(conn, s.id, "finished", now=clock())   # another process
+
+    assert sm.resync() is True
+    assert sm.phase is Phase.BREAK, "must pass through BREAK, not jump to IDLE"
+    clock.advance(minutes=cfg.session.break_minutes + 1)
+    assert sm.phase is Phase.IDLE
+
+
+def test_resync_does_not_start_a_break_out_of_nowhere(conn, cfg, clock):
+    """No session was running, so nothing ended and no break is owed."""
+    sm = SessionManager(conn, cfg, clock=clock)
+    assert sm.resync() is False
+    assert sm.phase is Phase.IDLE

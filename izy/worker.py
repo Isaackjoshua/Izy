@@ -13,10 +13,15 @@ from __future__ import annotations
 
 import logging
 
+from dataclasses import replace
+
 from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 
 from . import db
 from .budget import InterruptionBudget
+from .llm import LLM
+from .reminders import ReminderScheduler, parse as parse_reminder
+from .reminders import store as reminder_store
 from .selflabel import SelfLabelPrompt
 from .sessions import Phase, SessionManager
 from .tracker import Tracker
@@ -32,6 +37,8 @@ class TrackerWorker(QObject):
     ready = Signal(str)                 # watcher description
     phase_changed = Signal(str, object)  # phase value, Session|None
     ask_self_label = Signal(int, str, str)  # event_id, app, title
+    show_reminder = Signal(int, str)        # reminder_id, text
+    confirm_reminder = Signal(str)          # original text we could not parse
     status = Signal(str)
 
     def __init__(self, cfg, db_path=None) -> None:
@@ -44,8 +51,13 @@ class TrackerWorker(QObject):
         self.sessions = None
         self.selflabel = None
         self.budget = None
+        self.llm = None
+        self.reminders = None
         self._timer = None
         self._last_resync = None
+        self._last_eod_check = None
+        self._last_phase = None
+        self._seen_apps: set[str] = set()
 
     @Slot()
     def start(self) -> None:
@@ -59,6 +71,8 @@ class TrackerWorker(QObject):
         self.sessions = SessionManager(self.conn, self.cfg)
         self.selflabel = SelfLabelPrompt(self.conn, self.cfg)
         self.budget = InterruptionBudget(self.conn, self.cfg)
+        self.llm = LLM(self.conn, self.cfg)
+        self.reminders = ReminderScheduler(self.conn, self.cfg)
 
         self.sessions.on_change(self._on_phase_change)
         self.sessions.recover()
@@ -105,6 +119,36 @@ class TrackerWorker(QObject):
         if self.sessions.is_overrun():
             self._maybe_overrun()
         self._maybe_self_label()
+        self._check_reminders(snap)
+
+    # --- reminders ---------------------------------------------------------
+
+    def _check_reminders(self, snap) -> None:
+        """Time reminders, app_opened triggers, and end_of_day. Phase changes
+        are handled in _on_phase_change, which is the only place that knows a
+        boundary was actually crossed."""
+        try:
+            phase = self.sessions.phase
+            for r in self.reminders.due_now(phase):
+                self._fire(r)
+
+            if snap is not None and snap.app:
+                app = snap.app.lower()
+                if app not in self._seen_apps:
+                    self._seen_apps.add(app)
+                    for r in self.reminders.on_context(f"app_opened:{app}"):
+                        self._fire(r)
+
+            if self.reminders.end_of_day_due(self._last_eod_check):
+                self._last_eod_check = self.sessions.clock()
+                for r in self.reminders.on_context("end_of_day"):
+                    self._fire(r)
+        except Exception:
+            log.exception("reminder check failed")
+
+    def _fire(self, reminder) -> None:
+        self.reminders.fired(reminder.id)
+        self.show_reminder.emit(reminder.id, reminder.text)
 
     def _maybe_resync(self) -> None:
         now = self.sessions.clock()
@@ -163,8 +207,52 @@ class TrackerWorker(QObject):
     def request_skip_label(self) -> None:
         self.selflabel.skip()
 
+    @Slot(str)
+    def request_add_reminder(self, raw: str) -> None:
+        """Parse and store. Asks rather than guessing when nothing is readable —
+        SPEC.md forbids inventing a time that was not stated."""
+        try:
+            parsed = parse_reminder(raw, self.llm)
+        except Exception:
+            log.exception("reminder parse failed")
+            self.confirm_reminder.emit(raw)
+            return
+        if not parsed.is_valid():
+            self.confirm_reminder.emit(raw)
+            return
+        if parsed.urgent:
+            parsed = replace(parsed, text=f"[urgent] {parsed.text}")
+        r = reminder_store.add(self.conn, parsed)
+        when = r.due_at.astimezone().strftime("%H:%M") if r.due_at else r.trigger_context
+        self.status.emit(f"reminder saved for {when}")
+
+    @Slot(int)
+    def request_reminder_done(self, reminder_id: int) -> None:
+        self.reminders.done(reminder_id)
+
+    @Slot(int)
+    def request_reminder_snooze(self, reminder_id: int) -> None:
+        self.reminders.snooze(reminder_id)
+
+    @Slot(int)
+    def request_reminder_dismiss(self, reminder_id: int) -> None:
+        self.reminders.dismiss(reminder_id)
+
     def _on_phase_change(self, phase, session) -> None:
         self.tracker.set_session(session.id if session else None)
+        old, self._last_phase = self._last_phase, phase
+        if self.reminders is not None and old is not None:
+            try:
+                for context in self.reminders.contexts_for_phase_change(old, phase):
+                    for r in self.reminders.on_context(context):
+                        self._fire(r)
+                # Leaving a focus session is a natural boundary: release
+                # anything that came due while we were protecting the focus.
+                if old is Phase.FOCUS and phase is not Phase.FOCUS:
+                    for r in self.reminders.on_boundary(phase):
+                        self._fire(r)
+            except Exception:
+                log.exception("reminder phase hook failed")
         self.phase_changed.emit(phase.value, session)
 
 

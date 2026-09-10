@@ -16,7 +16,7 @@ from pathlib import Path
 from . import paths
 from .models import Session, Snapshot, from_iso, to_iso, utcnow
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -73,6 +73,30 @@ CREATE TABLE IF NOT EXISTS interventions (
     user_response TEXT CHECK (user_response IN ('dismissed','acknowledged','snoozed'))
 );
 CREATE INDEX IF NOT EXISTS idx_interventions_ts ON interventions(ts);
+
+-- Every LLM call, so spend is visible in the retrospective rather than a
+-- surprise on a bill. Written by izy/llm.py and nowhere else.
+CREATE TABLE IF NOT EXISTS llm_calls (
+    id            INTEGER PRIMARY KEY,
+    ts            TEXT NOT NULL,
+    purpose       TEXT NOT NULL,
+    model         TEXT NOT NULL,
+    input_tokens  INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd      REAL NOT NULL DEFAULT 0,
+    cached        INTEGER NOT NULL DEFAULT 0,
+    ok            INTEGER NOT NULL DEFAULT 1,
+    error         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_llm_calls_ts ON llm_calls(ts);
+
+-- Response cache. Identical questions must never be paid for twice.
+CREATE TABLE IF NOT EXISTS llm_cache (
+    key        TEXT PRIMARY KEY,
+    purpose    TEXT NOT NULL,
+    response   TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
