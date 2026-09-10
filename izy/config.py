@@ -214,6 +214,14 @@ proximity_px = 200
 
 # Normal resting opacity.
 opacity = 0.9
+
+# Follow you onto every workspace. A companion that lives on one workspace is
+# invisible the moment you switch, which looks exactly like it has crashed.
+# Achieving this on X11 means asking the window manager not to manage the
+# overlay at all, which is also what keeps it off the taskbar and out of
+# alt-tab. Set false to have it behave as an ordinary window pinned to the
+# workspace it started on.
+all_workspaces = true
 '''
 
 
@@ -306,6 +314,7 @@ class MascotConfig:
     dim_opacity: float = 0.35
     proximity_px: int = 200
     opacity: float = 0.9
+    all_workspaces: bool = True
 
 
 @dataclass(frozen=True)

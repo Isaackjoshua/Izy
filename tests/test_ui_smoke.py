@@ -197,3 +197,30 @@ def test_remind_me_in_the_intent_box_is_routed_to_reminders(qapp):
     p2.edit.setText("fix the dataloader")
     p2._submit()
     assert got == ["fix the dataloader"]
+
+
+def test_the_mascot_is_not_pinned_to_one_workspace(qapp):
+    """Measured live: as an ordinary managed window the mascot was bound to
+    _NET_WM_DESKTOP 2 while the desktop was on 3, where GNOME reports it Iconic
+    and it is simply not on screen. Unmanaged windows have no workspace."""
+    m = Mascot(Config())
+    assert m.windowFlags() & Qt.X11BypassWindowManagerHint
+    m.close()
+
+
+def test_all_workspaces_can_be_turned_off(qapp):
+    from dataclasses import replace
+    cfg = Config()
+    cfg = replace(cfg, mascot=replace(cfg.mascot, all_workspaces=False))
+    m = Mascot(cfg)
+    assert not (m.windowFlags() & Qt.X11BypassWindowManagerHint)
+    assert m.windowFlags() & Qt.Tool
+    m.close()
+
+
+def test_unmanaged_mode_keeps_itself_on_top(qapp):
+    """Nothing else will raise an unmanaged window above newly mapped ones."""
+    m = Mascot(Config())
+    assert m._raise_timer is not None and m._raise_timer.isActive()
+    m._keep_on_top()          # must be safe to call whether shown or not
+    m.close()

@@ -65,12 +65,18 @@ class Mascot(QWidget):
         # clicks until the cursor happened to pass near it.
         self._click_through: bool | None = None
 
-        self.setWindowFlags(
-            Qt.FramelessWindowHint
-            | Qt.WindowStaysOnTopHint
-            | Qt.Tool                      # no taskbar entry, no alt-tab
-            | Qt.WindowDoesNotAcceptFocus  # must never steal keyboard focus
-        )
+        flags = (Qt.FramelessWindowHint
+                 | Qt.WindowStaysOnTopHint
+                 | Qt.Tool                      # no taskbar entry, no alt-tab
+                 | Qt.WindowDoesNotAcceptFocus)  # must never steal keyboard focus
+        if cfg.mascot.all_workspaces:
+            # A managed window gets pinned to the workspace it was mapped on:
+            # measured live, the mascot sat on _NET_WM_DESKTOP 2 while the
+            # desktop was on 3, where GNOME reports it as Iconic and you simply
+            # cannot see it. Asking X not to manage the window leaves it with no
+            # workspace at all, so it is present on every one.
+            flags |= Qt.Window | Qt.X11BypassWindowManagerHint
+        self.setWindowFlags(flags)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setWindowTitle("Izy")
@@ -92,6 +98,21 @@ class Mascot(QWidget):
 
         self._opacity_anim = QPropertyAnimation(self, b"windowOpacity", self)
         self._opacity_anim.setDuration(180)
+
+        # An unmanaged window is not kept above newly mapped ones by the window
+        # manager, because the window manager is not involved. A slow re-raise
+        # holds the "always on top" promise; it changes no pixels, so there is
+        # still nothing here that reads as motion.
+        self._raise_timer = None
+        if cfg.mascot.all_workspaces:
+            self._raise_timer = QTimer(self)
+            self._raise_timer.setInterval(5000)
+            self._raise_timer.timeout.connect(self._keep_on_top)
+            self._raise_timer.start()
+
+    def _keep_on_top(self) -> None:
+        if self.isVisible():
+            self.raise_()
 
     # --- placement ---------------------------------------------------------
 
