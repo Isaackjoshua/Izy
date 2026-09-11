@@ -61,6 +61,17 @@ class SelfLabelPrompt:
         elapsed = (now - self.last_asked).total_seconds() / 60.0
         return elapsed >= self.cfg.self_label.every_minutes
 
+    def mark_asked(self) -> None:
+        """Record that a prompt has just been shown, so the every_minutes gate
+        holds until the next interval.
+
+        The pipeline calls this the moment it emits a prompt. Without it, the
+        emit path left `last_asked` untouched, `due()` stayed true, and the
+        prompt re-fired on every 1 Hz tick until it was dismissed — 15 prompts
+        in 18 seconds, observed on a real machine. `due()` is what limits this
+        to once an hour; nothing else does, so the ask has to record the slot."""
+        self.last_asked = self.clock()
+
     def pick_event(self):
         """The most substantial non-AFK event since the last prompt.
 

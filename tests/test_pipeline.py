@@ -302,3 +302,53 @@ def test_every_pipeline_event_has_a_signal():
     assert kinds <= mapped, f"unmapped pipeline events: {kinds - mapped}"
     for signal in TrackerWorker._SIGNALS.values():
         assert hasattr(TrackerWorker, signal), f"missing signal: {signal}"
+
+
+# --- the self-label spam regression ----------------------------------------
+
+def test_the_self_label_prompt_fires_once_not_every_tick(conn, cfg, clock):
+    """The bug a user hit: 15 self-label prompts in 18 seconds. The emit path
+    never marked the slot used, so due() stayed true and it re-fired on every
+    1 Hz tick until dismissed. One ask per interval, and no more."""
+    from dataclasses import replace
+    cfg = replace(cfg, self_label=replace(cfg.self_label, every_minutes=60,
+                                          active_from="00:00", active_until="23:59"))
+    watcher = FakeWatcher([("Code", "main.py")])
+    p = _pipeline(conn, cfg, clock, watcher)
+    p.start()
+
+    # An event worth asking about, and a full interval elapsed since the arm.
+    for _ in range(3):
+        p.tick(); clock.advance(seconds=1)
+    p.tracker.flush()
+    clock.advance(minutes=61)
+
+    asks = 0
+    for _ in range(30):                    # 30 ticks = 30 seconds of the old bug
+        asks += _kinds(p.tick()).count(pl.SELF_LABEL)
+        clock.advance(seconds=1)
+    assert asks == 1, f"expected exactly one self-label prompt, got {asks}"
+
+
+def test_the_next_self_label_waits_a_full_interval(conn, cfg, clock):
+    from dataclasses import replace
+    from izy.models import Snapshot
+    cfg = replace(cfg, self_label=replace(cfg.self_label, every_minutes=60,
+                                          active_from="00:00", active_until="23:59"))
+    p = _pipeline(conn, cfg, clock)
+    p.start()
+    p.tick()          # arms last_asked (it begins None; the first due() sets it)
+
+    def some_activity(app):
+        # A closed span in each interval, so pick_event always has something.
+        eid = db.open_event(conn, Snapshot(ts=clock(), app=app, title=f"{app} w"), None)
+        db.update_event_duration(conn, eid, 120)
+
+    some_activity("Code")
+    clock.advance(minutes=61)
+    assert pl.SELF_LABEL in _kinds(p.tick())          # first ask
+    clock.advance(minutes=30)
+    some_activity("Firefox")
+    assert pl.SELF_LABEL not in _kinds(p.tick())      # too soon
+    clock.advance(minutes=31)
+    assert pl.SELF_LABEL in _kinds(p.tick())          # next interval

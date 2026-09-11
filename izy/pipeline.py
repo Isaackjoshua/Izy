@@ -234,8 +234,13 @@ class Pipeline:
             return
         row = self.selflabel.pick_event()
         if row is None:
-            self.selflabel.last_asked = self.clock()
+            self.selflabel.mark_asked()
             return
+        # Mark the slot used *before* emitting. This is the whole fix: the emit
+        # path used to leave last_asked untouched, so due() stayed true and the
+        # prompt re-fired every tick. The dismissal/answer is recorded when the
+        # user responds (skip/record), so it is not recorded again here.
+        self.selflabel.mark_asked()
         self._emit(SELF_LABEL, row["id"], row["app"] or "", row["window_title"] or "")
 
     # --- classification ----------------------------------------------------
