@@ -105,6 +105,19 @@ CREATE TABLE IF NOT EXISTS meta (
 """
 
 
+def connect_readonly(path: Path | None = None) -> sqlite3.Connection:
+    """A read-only view of the DB, for the API's GET handlers.
+
+    izy-v2.md §1: the API never writes to the DB — the tick is the one writer.
+    Opening with `mode=ro` enforces that at the SQLite level: any accidental
+    write raises rather than silently creating a second writer. No schema script
+    runs here, so this is a pure reader that also cannot race the migration."""
+    path = path or db_path()
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 def connect(path: Path | None = None) -> sqlite3.Connection:
     path = path or paths.db_path()
     if str(path) != ":memory:":
@@ -160,6 +173,13 @@ def open_session(conn) -> Session | None:
     r = conn.execute(
         "SELECT * FROM sessions WHERE ended_at IS NULL ORDER BY id DESC LIMIT 1"
     ).fetchone()
+    return _row_to_session(r) if r else None
+
+
+def latest_session(conn) -> Session | None:
+    """The most recently started session, open or closed — used to answer an
+    outcome that arrives after the session has already ended."""
+    r = conn.execute("SELECT * FROM sessions ORDER BY id DESC LIMIT 1").fetchone()
     return _row_to_session(r) if r else None
 
 

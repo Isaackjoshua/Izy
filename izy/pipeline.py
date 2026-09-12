@@ -21,8 +21,9 @@ from . import db
 from .budget import InterruptionBudget
 from .classifier import Classifier
 from .drift import DriftDetector
+from .ipc import StateSnapshot
 from .llm import LLM
-from .models import utcnow
+from .models import to_iso, utcnow
 from .reminders import ReminderScheduler, parse as parse_reminder
 from .reminders import store as reminder_store
 from .selflabel import SelfLabelPrompt
@@ -60,11 +61,16 @@ class Pipeline:
     RESYNC_EVERY_S = 3.0
 
     def __init__(self, cfg, db_path=None, *, clock=utcnow, watcher=None,
-                 conn=None, llm=None) -> None:
+                 conn=None, llm=None, command_queue=None, state_bus=None) -> None:
         self.cfg = cfg
         self.clock = clock
         self.conn = conn if conn is not None else db.connect(db_path)
         self.watcher = watcher if watcher is not None else pick_watcher(cfg.watcher)
+        # The control plane (izy-v2.md §1). Both optional: the daemon supplies
+        # them, tests and headless runs leave them None and the tick behaves
+        # exactly as before — no command draining, no publishing.
+        self.command_queue = command_queue
+        self.state_bus = state_bus
 
         self.tracker = Tracker(
             self.conn,
@@ -87,6 +93,8 @@ class Pipeline:
         self._last_classified_id = 0
         self._seen_apps: set[str] = set()
         self._mascot_state = None
+        self._tick_count = 0
+        self._last_snap = None          # last Snapshot the watcher returned
 
         self.sessions.on_change(self._on_phase_change)
 
@@ -113,7 +121,21 @@ class Pipeline:
     # --- the tick ----------------------------------------------------------
 
     def tick(self) -> list[Event]:
-        """One poll's worth of work. Returns what the UI should be told."""
+        """One poll's worth of work. Returns what the UI was told this tick.
+
+        Tick order (izy-v2.md §2 will insert the arbiter; Phase 1 only adds the
+        command drain at the front and state publication at the end):
+
+          1  drain_commands   — run API/CLI requests on the single writer thread
+             maybe_resync     — reconcile CLI-direct DB writes (the old path)
+          2  poll watcher
+          3  record span
+          4  maybe_overrun / self_label / reminders / classify / drift
+          5  update_mascot
+          6  publish_state    — hand clients an immutable snapshot
+        """
+        self._tick_count += 1
+        self._drain_commands()
         self._maybe_resync()
 
         try:
@@ -121,6 +143,7 @@ class Pipeline:
         except Exception:
             log.exception("watcher poll failed")
             snap = None
+        self._last_snap = snap
         try:
             self.tracker.tick(snap)
         except Exception:
@@ -133,6 +156,7 @@ class Pipeline:
         self._classify_new_events()
         self._check_drift()
         self._update_mascot()
+        self._publish_state()
         return self._drain()
 
     def _drain(self) -> list[Event]:
@@ -141,6 +165,118 @@ class Pipeline:
 
     def _emit(self, kind: str, *payload) -> None:
         self._out.append(Event(kind, payload))
+
+    # --- control plane -----------------------------------------------------
+
+    #: Command name -> the Pipeline method it dispatches to. This is the entire
+    #: set of mutations the API and CLI can ask for; nothing outside it can
+    #: reach the writer. Methods that return a value have it delivered back
+    #: through the command's Future.
+    _COMMANDS = {
+        "start_session": "start_session",
+        "end_session": "end_session",
+        "record_outcome": "record_outcome",
+        "add_reminder": "add_reminder",
+        "reminder_done": "reminder_done",
+        "reminder_snooze": "reminder_snooze",
+        "reminder_dismiss": "reminder_dismiss",
+        "record_self_label": "record_self_label",
+        "skip_self_label": "skip_self_label",
+        "record_on_task_answer": "record_on_task_answer",
+        "record_drift_response": "record_drift_response",
+    }
+
+    def _drain_commands(self) -> None:
+        """Run every queued command on the tick thread — the one writer.
+
+        Each command's Future gets the method's return value, or the exception,
+        so an HTTP handler on another thread can wait for a real result without
+        ever touching the DB itself. A bad command name fails its own Future and
+        does not disturb the tick.
+        """
+        if self.command_queue is None:
+            return
+        for cmd in self.command_queue.drain():
+            method = self._COMMANDS.get(cmd.name)
+            try:
+                if method is None:
+                    raise ValueError(f"unknown command: {cmd.name}")
+                result = getattr(self, method)(**cmd.args)
+                if not cmd.future.done():
+                    cmd.future.set_result(result)
+            except Exception as e:
+                log.exception("command %s failed", cmd.name)
+                if not cmd.future.done():
+                    cmd.future.set_exception(e)
+
+    def _publish_state(self) -> None:
+        if self.state_bus is None:
+            return
+        try:
+            self.state_bus.publish(self.snapshot())
+        except Exception:
+            log.exception("state publish failed")
+
+    def snapshot(self) -> StateSnapshot:
+        """Build the immutable picture clients read. Pure reads; safe to call
+        from the tick or a test."""
+        phase = self.sessions.phase
+        session = self.sessions.current
+        session_dict = None
+        if session and session.is_open:
+            remaining = self.sessions.remaining()
+            elapsed = (self.clock() - session.started_at).total_seconds()
+            session_dict = {
+                "id": session.id,
+                "intent": session.declared_intent,
+                "planned_minutes": session.planned_minutes,
+                "elapsed_s": int(max(0, elapsed)),
+                "remaining_s": int(remaining.total_seconds()) if remaining else 0,
+            }
+        snap = self._last_snap
+        return StateSnapshot(
+            tick=self._tick_count,
+            ts=to_iso(self.clock()),
+            mascot=self.mascot_state(),
+            phase=phase.value,
+            watcher=self.describe(),
+            session=session_dict,
+            focus_app=(snap.app if snap else None),
+            focus_title=(snap.title if snap else None),
+            counters=self._today_counters(),
+            connected=True,
+        )
+
+    def _today_counters(self) -> dict:
+        """Today's headline numbers, read straight from the DB so they survive a
+        restart. Kept cheap: a handful of indexed aggregates once per tick."""
+        try:
+            day = self.clock()
+            lo, hi = db.day_bounds(day)
+            on = off = afk = 0.0
+            rows = self.conn.execute(
+                "SELECT e.duration_s, e.afk,"
+                " (SELECT l.on_task FROM labels l WHERE l.event_id = e.id"
+                "  ORDER BY l.id DESC LIMIT 1) AS on_task"
+                " FROM activity_events e WHERE e.ts >= ? AND e.ts < ?", (lo, hi)
+            ).fetchall()
+            for r in rows:
+                if r["afk"]:
+                    afk += r["duration_s"] or 0
+                elif r["on_task"] == 1:
+                    on += r["duration_s"] or 0
+                elif r["on_task"] == 0:
+                    off += r["duration_s"] or 0
+            sessions = self.conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE started_at >= ? AND started_at < ?",
+                (lo, hi)).fetchone()[0]
+            calls, cost = self.llm.spend_today()
+            return {"on_task_s": int(on), "off_task_s": int(off), "afk_s": int(afk),
+                    "sessions": sessions, "tier3_calls": calls,
+                    "tier3_cost_usd": round(cost, 4)}
+        except Exception:
+            log.exception("counter build failed")
+            return {}
 
     # --- mascot ------------------------------------------------------------
 
@@ -353,9 +489,16 @@ class Pipeline:
         self.sessions.end(outcome or None)
         return self._drain()
 
-    def record_outcome(self, session_id: int, outcome: str) -> None:
+    def record_outcome(self, session_id: int | None, outcome: str) -> None:
         """Answer the outcome question after the fact — by the time it is
-        answered the session is already closed."""
+        answered the session is already closed. With session_id None (the API
+        path), apply it to the most recent session."""
+        if session_id is None:
+            latest = db.latest_session(self.conn)
+            if latest is None:
+                log.warning("record_outcome: no session to apply %r to", outcome)
+                return
+            session_id = latest.id
         try:
             self.sessions.record_outcome(session_id, outcome)
         except ValueError as e:

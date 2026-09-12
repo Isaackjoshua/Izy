@@ -32,6 +32,23 @@ def state_dir() -> Path:
     return _xdg("XDG_STATE_HOME", ".local/state") / APP_NAME
 
 
+def runtime_dir() -> Path:
+    """$XDG_RUNTIME_DIR/izy — the control-plane socket lives here.
+
+    izy-v2.md §1 requires a Unix domain socket, never a TCP port. XDG_RUNTIME_DIR
+    is the right home: it is user-private (mode 0700), tmpfs-backed, and cleared
+    on logout, so a stale socket never survives a session. Falls back to the
+    state dir on the rare system where it is unset (e.g. a bare cron context)."""
+    if override := os.environ.get("IZY_RUNTIME_DIR"):
+        return Path(override) / APP_NAME
+    base = os.environ.get("XDG_RUNTIME_DIR")
+    return (Path(base) / APP_NAME) if base else (state_dir() / "run")
+
+
+def socket_path() -> Path:
+    return runtime_dir() / "izy.sock"
+
+
 def db_path() -> Path:
     return data_dir() / "data.db"
 
@@ -43,3 +60,5 @@ def config_path() -> Path:
 def ensure_dirs() -> None:
     for d in (data_dir(), config_dir(), state_dir()):
         d.mkdir(parents=True, exist_ok=True)
+    # The runtime dir is private; the socket under it is chmod 0600 by the API.
+    runtime_dir().mkdir(parents=True, exist_ok=True, mode=0o700)

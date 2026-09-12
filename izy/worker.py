@@ -40,10 +40,12 @@ class TrackerWorker(QObject):
     ask_outcome = Signal(int, str)          # session_id, intent
     status = Signal(str)
 
-    def __init__(self, cfg, db_path=None) -> None:
+    def __init__(self, cfg, db_path=None, command_queue=None, state_bus=None) -> None:
         super().__init__()
         self.cfg = cfg
         self._db_path = db_path
+        self._command_queue = command_queue
+        self._state_bus = state_bus
         self.pipeline: pl.Pipeline | None = None
         self._timer = None
 
@@ -54,7 +56,9 @@ class TrackerWorker(QObject):
 
     @Slot()
     def start(self) -> None:
-        self.pipeline = pl.Pipeline(self.cfg, self._db_path)
+        self.pipeline = pl.Pipeline(self.cfg, self._db_path,
+                                    command_queue=self._command_queue,
+                                    state_bus=self._state_bus)
         self.ready.emit(self.pipeline.describe())
         self._dispatch(self.pipeline.start())
 
@@ -146,10 +150,10 @@ class TrackerWorker(QObject):
 class TrackerThread:
     """Owns the QThread and keeps the worker alive on it."""
 
-    def __init__(self, cfg, db_path=None) -> None:
+    def __init__(self, cfg, db_path=None, command_queue=None, state_bus=None) -> None:
         self.thread = QThread()
         self.thread.setObjectName("izy-tracker")
-        self.worker = TrackerWorker(cfg, db_path)
+        self.worker = TrackerWorker(cfg, db_path, command_queue, state_bus)
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.start)
         self._stopped = False

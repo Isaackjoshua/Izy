@@ -192,6 +192,32 @@ def _build_bridge():
     return UiBridge
 
 
+def _start_api(cfg, command_queue, state_bus):
+    """Start the control-plane server, or return None if it cannot start.
+
+    Isolated on purpose: izy-v2.md §1's invariant is that the daemon stays
+    headless-capable and that killing the API never stops tracking. So a failure
+    to bind the socket (missing deps, a permissions problem) is logged and
+    swallowed — the tick runs regardless.
+    """
+    if os.environ.get("IZY_NO_API"):
+        log.info("IZY_NO_API set; control-plane server not started")
+        return None
+    try:
+        from .api import ApiServer, build_app
+        app = build_app(command_queue, state_bus, cfg)
+        server = ApiServer(app)
+        server.start()
+        if server.wait_until_ready(timeout=5.0):
+            log.info("control plane on %s", server.sock_path)
+        else:
+            log.warning("control-plane server slow to start; continuing anyway")
+        return server
+    except Exception:
+        log.exception("control-plane server failed to start; tracking continues")
+        return None
+
+
 def run(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         level=os.environ.get("IZY_LOG", "INFO").upper(),
@@ -212,8 +238,16 @@ def run(argv: list[str] | None = None) -> int:
     # Closing the last popup must not exit the daemon.
     app.setQuitOnLastWindowClosed(False)
 
+    # Control plane (izy-v2.md §1). The queue and bus are created here and
+    # shared: the tick (inside the worker) drains the queue and publishes to the
+    # bus; the API server thread submits commands and reads the bus. One writer.
+    from .ipc import CommandQueue, StateBus
+    command_queue = CommandQueue()
+    state_bus = StateBus()
+    api_server = _start_api(cfg, command_queue, state_bus)
+
     mascot = Mascot(cfg)
-    tracker = TrackerThread(cfg)
+    tracker = TrackerThread(cfg, command_queue=command_queue, state_bus=state_bus)
     bridge = _build_bridge()(cfg, mascot, tracker.worker)
 
     tracker.worker.ready.connect(bridge.on_ready)
@@ -232,6 +266,8 @@ def run(argv: list[str] | None = None) -> int:
 
     def shutdown(*_):
         log.info("shutting down")
+        if api_server is not None:
+            api_server.stop()
         tracker.stop()
         app.quit()
 
