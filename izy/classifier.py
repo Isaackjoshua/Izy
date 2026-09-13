@@ -101,6 +101,13 @@ class Classifier:
         #: event ids we have already asked the user about, so tier 4 does not
         #: re-ask about the same window every tick.
         self._asked: set[int] = set()
+        #: hints of the task backing the current session, or None. Loaded when a
+        #: task-backed session starts (izy-v2.md §3), so the task's own apps and
+        #: domains resolve on-task for free and never reach the paid tier.
+        self._session_hints: dict | None = None
+
+    def set_session_hints(self, hints: dict | None) -> None:
+        self._session_hints = hints or None
 
     # --- entry point -------------------------------------------------------
 
@@ -132,6 +139,14 @@ class Classifier:
         if decision:
             self._record(event_row["id"], decision)
             return decision
+
+        # Task hints: the current task's own apps/domains are on-task for free,
+        # checked after the config deny rules but before any paid tier.
+        hint = rules.hint_decision(self._session_hints, event_row["app"],
+                                   event_row["window_title"], event_row["url"])
+        if hint:
+            self._record(event_row["id"], hint)
+            return hint
 
         cached = self._cached_verdict(intent, event_row)
         if cached:

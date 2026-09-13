@@ -122,6 +122,34 @@ rule you add is a call you never pay for again.
 Correct a wrong call with `izy relabel <event-id> on|off`; `izy day` prints the
 audit of every tier 3 and tier 4 decision with its reason.
 
+## Tasks and the Eisenhower matrix
+
+Tasks live in their own table; the quadrant is **derived** from two flags, never
+stored — Q1 urgent&important, Q2 important not urgent, Q3 urgent not important,
+Q4 neither — so a card dragged between quadrants just sets the flags and there is
+never a stored quadrant that disagrees.
+
+```bash
+izy task add "write the report" --important --hint-app libreoffice-writer
+izy task list
+izy start "write the report" --task 3     # a session that knows its task
+```
+
+The integration that earns its keep is `hints`: the apps and domains a task
+uses. A session started from a task loads them as **free tier-1/2 classification
+rules for that session**, so the task's own windows resolve on-task without ever
+reaching the paid tier — Izy gets cheaper the more you work a task. When a paid
+or asked verdict finds an app on-task for a task-backed session, it is recorded
+as a one-tap *suggestion* to add to the hints, never added automatically.
+
+The matrix is also self-observing: once a week the arbiter surfaces one
+Important-not-urgent task with no session in seven days — the gap between what
+you *labelled* important and what you actually spent time on is the point of the
+whole thing. The API exposes tasks (`/tasks`, drag via `/tasks/{id}/quadrant`,
+reorder, hint-accept); sessions carry a soft `task_id` link (not an enforced
+foreign key, so the daemon and CLI can each write without cross-process
+contention).
+
 ## The interrupt arbiter
 
 Since the v2 control plane, every would-be interruption — a drift alert, a due

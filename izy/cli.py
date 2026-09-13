@@ -17,6 +17,7 @@ from .commands import env as env_cmd
 from .commands import reminder as reminder_cmd
 from .commands import report as report_cmd
 from .commands import session as session_cmd
+from .commands import task as task_cmd
 
 #: Re-exported so `from izy.cli import EXT_UUID` keeps working.
 EXT_UUID = env_cmd.EXT_UUID
@@ -61,11 +62,33 @@ def build_parser() -> argparse.ArgumentParser:
     st = sub.add_parser("start", help="start a focus session")
     st.add_argument("intent", help="what you are working on")
     st.add_argument("-m", "--minutes", type=int, default=None)
+    st.add_argument("--task", type=int, default=None,
+                    help="start from a task, loading its hints for free classification")
     st.set_defaults(func=session_cmd.cmd_start)
 
     sp = sub.add_parser("stop", help="end the open focus session")
     sp.add_argument("outcome", nargs="?", choices=["finished", "partly", "no"])
     sp.set_defaults(func=session_cmd.cmd_stop)
+
+    tk = sub.add_parser("task", help="create and manage tasks (Eisenhower matrix)")
+    tksub = tk.add_subparsers(dest="action", required=True)
+    tadd = tksub.add_parser("add", help="add a task")
+    tadd.add_argument("title")
+    tadd.add_argument("-u", "--urgent", action="store_true")
+    tadd.add_argument("-i", "--important", action="store_true")
+    tadd.add_argument("--pomos", type=int, default=None, help="estimate in pomodoros")
+    tadd.add_argument("--hint-app", action="append", help="app this task uses (repeatable)")
+    tadd.add_argument("--hint-domain", action="append", help="domain this task uses (repeatable)")
+    tls = tksub.add_parser("list", help="list tasks by quadrant")
+    tls.add_argument("--status", choices=["todo", "doing", "done", "dropped"], default=None)
+    tdone = tksub.add_parser("done", help="mark a task done"); tdone.add_argument("id", type=int)
+    trm = tksub.add_parser("rm", help="delete a task"); trm.add_argument("id", type=int)
+    tq = tksub.add_parser("quadrant", help="move a task between quadrants")
+    tq.add_argument("id", type=int); tq.add_argument("value", choices=["Q1","Q2","Q3","Q4"])
+    thint = tksub.add_parser("hint", help="add a hint to a task")
+    thint.add_argument("id", type=int)
+    thint.add_argument("--app"); thint.add_argument("--domain"); thint.add_argument("--keyword")
+    tk.set_defaults(func=task_cmd.cmd_task)
 
     cf = sub.add_parser("config", help="show the config file and whether it is current")
     cf.add_argument("--upgrade", action="store_true",

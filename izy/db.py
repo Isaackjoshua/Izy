@@ -16,7 +16,7 @@ from pathlib import Path
 from . import paths
 from .models import Session, Snapshot, from_iso, to_iso, utcnow
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 #: Forward-only, numbered migrations (izy-v2.md §9). The base SCHEMA below is the
 #: v2 baseline created idempotently; anything a later version adds lives here as
@@ -40,6 +40,61 @@ MIGRATIONS: dict[int, str] = {
     );
     CREATE INDEX IF NOT EXISTS idx_interrupt_log_ts   ON interrupt_log(ts);
     CREATE INDEX IF NOT EXISTS idx_interrupt_log_kind ON interrupt_log(kind, verdict);
+    """,
+    4: """
+    -- Phase 3: tasks and the Eisenhower matrix. The quadrant is DERIVED from the
+    -- two flags (Q1 urgent&important ... Q4 neither), never stored. `hints` is
+    -- the integration that earns its keep: apps/domains a task uses, loaded as
+    -- free tier-1/2 rules for a session started from the task.
+    CREATE TABLE IF NOT EXISTS task (
+        id             INTEGER PRIMARY KEY,
+        title          TEXT    NOT NULL,
+        notes          TEXT,
+        urgent         INTEGER NOT NULL DEFAULT 0,
+        important      INTEGER NOT NULL DEFAULT 0,
+        status         TEXT    NOT NULL DEFAULT 'todo',   -- todo|doing|done|dropped
+        due_at         TEXT,
+        estimate_pomos INTEGER,
+        actual_pomos   INTEGER NOT NULL DEFAULT 0,
+        hints          TEXT,                              -- JSON {"apps":[],"domains":[],"keywords":[]}
+        suggestions    TEXT,                              -- JSON [app|domain] awaiting your one-tap accept
+        parent_id      INTEGER REFERENCES task(id) ON DELETE CASCADE,
+        sort_key       REAL    NOT NULL,
+        created_at     TEXT    NOT NULL,
+        updated_at     TEXT    NOT NULL,
+        completed_at   TEXT
+    );
+    CREATE INDEX IF NOT EXISTS task_status_idx ON task(status, urgent, important);
+    CREATE INDEX IF NOT EXISTS task_due_idx    ON task(due_at) WHERE due_at IS NOT NULL;
+
+    ALTER TABLE sessions ADD COLUMN task_id INTEGER REFERENCES task(id);
+    """,
+    5: """
+    -- Phase 3 fix: sessions.task_id is a SOFT link, not an enforced foreign key.
+    -- The FK added at v4 is checked cross-connection, and the daemon's
+    -- long-lived WAL reader could not always see a task the CLI had just
+    -- committed on another connection — the session insert failed with
+    -- "FOREIGN KEY constraint failed". A session pointing at a since-deleted
+    -- task is harmless (it just shows no task), so we drop the enforcement by
+    -- rebuilding the table without the REFERENCES clause. Enforcement is off
+    -- only for the rebuild; connect() turns it back on.
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE sessions_rebuild (
+        id              INTEGER PRIMARY KEY,
+        started_at      TEXT NOT NULL,
+        ended_at        TEXT,
+        declared_intent TEXT NOT NULL,
+        planned_minutes INTEGER NOT NULL,
+        outcome         TEXT,
+        task_id         INTEGER
+    );
+    INSERT INTO sessions_rebuild (id, started_at, ended_at, declared_intent,
+        planned_minutes, outcome, task_id)
+        SELECT id, started_at, ended_at, declared_intent, planned_minutes,
+               outcome, task_id FROM sessions;
+    DROP TABLE sessions;
+    ALTER TABLE sessions_rebuild RENAME TO sessions;
+    PRAGMA foreign_keys=ON;
     """,
 }
 
@@ -152,6 +207,11 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    # Two processes write this DB — the daemon (the one writer for daemon state)
+    # and the CLI (tasks, sessions). WAL allows one writer at a time; without a
+    # busy timeout a write that collides with the other process fails instantly
+    # with "database is locked". Wait for the lock instead.
+    conn.execute("PRAGMA busy_timeout=5000")
     # The base SCHEMA is the v2 baseline: idempotent creates for every table
     # that existed at v2. A brand-new DB has no stored version, so it is treated
     # as being at the baseline and then brought forward by the migrations below.
@@ -199,13 +259,26 @@ def _backup(path, baseline: int) -> None:
 
 # --- sessions ---------------------------------------------------------------
 
-def start_session(conn, intent: str, planned_minutes: int, *, now=None) -> Session:
+def start_session(conn, intent: str, planned_minutes: int, *, now=None,
+                  task_id=None) -> Session:
     now = now or utcnow()
     cur = conn.execute(
-        "INSERT INTO sessions(started_at, declared_intent, planned_minutes) VALUES (?,?,?)",
-        (to_iso(now), intent, planned_minutes),
+        "INSERT INTO sessions(started_at, declared_intent, planned_minutes, task_id)"
+        " VALUES (?,?,?,?)",
+        (to_iso(now), intent, planned_minutes, task_id),
     )
     return Session(cur.lastrowid, now, intent, planned_minutes)
+
+
+def session_task_id(conn, session_id: int) -> int | None:
+    """The task a session was started from, or None. The `sessions` table gained
+    task_id at v4, so read it defensively for rows written before then."""
+    try:
+        r = conn.execute("SELECT task_id FROM sessions WHERE id = ?",
+                         (session_id,)).fetchone()
+        return r["task_id"] if r else None
+    except sqlite3.OperationalError:
+        return None
 
 
 def end_session(conn, session_id: int, outcome: str | None = None, *, now=None) -> None:
@@ -331,6 +404,19 @@ def interventions_since(conn, since: datetime) -> list[sqlite3.Row]:
     return conn.execute(
         "SELECT * FROM interventions WHERE ts >= ? ORDER BY ts", (to_iso(since),)
     ).fetchall()
+
+
+# --- meta (small durable markers) -------------------------------------------
+
+def get_meta(conn, key: str) -> str | None:
+    r = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return r["value"] if r else None
+
+
+def set_meta(conn, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES (?, ?)"
+        " ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
 
 
 # --- interrupt log (the arbiter's decisions) --------------------------------

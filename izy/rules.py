@@ -98,3 +98,26 @@ def free_tiers(cfg, app: str | None, title: str | None,
                url: str | None) -> Decision | None:
     """Tiers 1 and 2 in order. None means 'ask a paid tier'."""
     return tier1(cfg, app, title) or tier2(cfg, app, url)
+
+
+def hint_decision(hints: dict | None, app: str | None, title: str | None,
+                  url: str | None) -> Decision | None:
+    """A task's hints resolve its own windows on-task for free (izy-v2.md §3).
+
+    Only ever *on*-task and only at tier 1/2 — hints say "this task uses these
+    apps and domains", never "this is off-task". Checked after the config deny
+    rules (so a denied app still loses) but before any paid tier, which is what
+    keeps a hinted app from ever costing a tier-3 call. The reason names the
+    hint so the classification audit shows why it was free."""
+    if not hints:
+        return None
+    apps = hints.get("apps") or ()
+    domains = hints.get("domains") or ()
+    keywords = hints.get("keywords") or ()
+    if hit := _matches(apps, app):
+        return Decision(True, 1.0, f"task hint: app {hit}", 1)
+    if hit := _matches(keywords, title):
+        return Decision(True, 1.0, f"task hint: keyword {hit}", 1)
+    if url and (host := host_of(url)) and (hit := _matches(domains, host)):
+        return Decision(True, 1.0, f"task hint: domain {hit}", 2)
+    return None

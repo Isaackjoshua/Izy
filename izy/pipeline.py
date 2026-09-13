@@ -110,6 +110,8 @@ class Pipeline:
         self._last_report_day = None
         self._last_phase = None
         self._last_classified_id = 0
+        self._last_suggest_label_id = 0
+        self._last_q2_scan = None
         self._seen_apps: set[str] = set()
         self._mascot_state = None
         self._tick_count = 0
@@ -173,6 +175,8 @@ class Pipeline:
         self._maybe_self_label()              # step 6  -> submit
         self._check_reminders(snap)           # step 7  -> submit
         self._classify_new_events()           # step 9  (may submit tier-4)
+        self._collect_hint_suggestions()      # step 9b task hint suggestions
+        self._maybe_q2_nudge()                # step 9c neglected-Q2 nudge
         self._check_drift()                   # step 10 -> submit
         self._dispatch_interrupts(snap)       # step 11 <- the only place we show
         self._update_mascot()                 # step 12
@@ -204,6 +208,12 @@ class Pipeline:
         "skip_self_label": "skip_self_label",
         "record_on_task_answer": "record_on_task_answer",
         "record_drift_response": "record_drift_response",
+        "create_task": "create_task",
+        "update_task": "update_task",
+        "set_task_quadrant": "set_task_quadrant",
+        "reorder_task": "reorder_task",
+        "delete_task": "delete_task",
+        "accept_hint": "accept_hint",
     }
 
     def _drain_commands(self) -> None:
@@ -282,6 +292,12 @@ class Pipeline:
             self._emit(ASK_OUTCOME, p["session_id"], p["intent"])
         elif event == DRIFT:
             self._emit(DRIFT, p.get("id", 0), p["message"])
+        elif event == STATUS:
+            # A message-library-style line (Phase 3 uses this for the Q2 nudge;
+            # Phase 5 for the message library). It self-acknowledges — there is
+            # nothing to respond to — so it does not hold the one-at-a-time slot.
+            self._emit(STATUS, p["message"])
+            self.arbiter.acknowledge()
 
     def _ack_interrupt(self) -> None:
         """A response to whatever is on screen frees the one-at-a-time slot."""
@@ -389,8 +405,22 @@ class Pipeline:
         except Exception:
             log.exception("session resync failed")
 
+    def _load_session_hints(self) -> None:
+        """Point the classifier at the current session's task hints, if any.
+        Called on start and on every phase change, so hints load for a
+        CLI-started task session and clear the moment the session ends."""
+        from . import tasks as task_store
+        session = self.sessions.current
+        hints = None
+        if session and session.is_open:
+            tid = db.session_task_id(self.conn, session.id)
+            if tid is not None:
+                hints = task_store.get_hints(self.conn, tid)
+        self.classifier.set_session_hints(hints)
+
     def _on_phase_change(self, phase, session) -> None:
         self.tracker.set_session(session.id if session else None)
+        self._load_session_hints()
         old, self._last_phase = self._last_phase, phase
         if old is not None:
             try:
@@ -486,6 +516,62 @@ class Pipeline:
                 dedupe_key=f"ask_on_task:{pending.event_id}",
                 requested_at=self.clock()))
 
+    # --- tasks (izy-v2.md §3) ----------------------------------------------
+
+    def _collect_hint_suggestions(self) -> None:
+        """When a paid or asked verdict resolves a span on-task for a task-backed
+        session, remember its app as a hint suggestion — a one-tap acceptance
+        later, so Izy gets cheaper the more the task is worked. Scans only labels
+        newer than the last scan (source llm/user; hint labels are 'rule' and so
+        are excluded — no point suggesting what is already a hint)."""
+        try:
+            session = self.sessions.current
+            if not session or not session.is_open:
+                return
+            tid = db.session_task_id(self.conn, session.id)
+            if tid is None:
+                return
+            rows = self.conn.execute(
+                "SELECT l.id, e.app FROM labels l"
+                " JOIN activity_events e ON e.id = l.event_id"
+                " WHERE l.id > ? AND e.session_id = ? AND l.source IN ('llm','user')"
+                "   AND l.on_task = 1 AND e.app IS NOT NULL ORDER BY l.id",
+                (self._last_suggest_label_id, session.id)).fetchall()
+            from . import tasks as task_store
+            for r in rows:
+                self._last_suggest_label_id = max(self._last_suggest_label_id, r["id"])
+                task_store.suggest_hint(self.conn, tid, r["app"])
+        except Exception:
+            log.exception("hint suggestion scan failed")
+
+    def _maybe_q2_nudge(self) -> None:
+        """Once a week, surface one Important-not-urgent task with no session in
+        the last 7 days — the point of the whole matrix. Priority 10, through the
+        arbiter, which will usually say no. The scan itself is throttled to once
+        an hour so it costs nothing per tick."""
+        try:
+            now = self.clock()
+            if self._last_q2_scan is not None and \
+                    (now - self._last_q2_scan).total_seconds() < 3600:
+                return
+            self._last_q2_scan = now
+            last = db.get_meta(self.conn, "last_q2_nudge")
+            if last and (now - from_iso(last)).days < 7:
+                return
+            from . import tasks as task_store
+            task = task_store.neglected_q2(self.conn, now)
+            if task is None:
+                return
+            db.set_meta(self.conn, "last_q2_nudge", to_iso(now))
+            self.arbiter.submit(Request(
+                "message",
+                payload={"event": STATUS,
+                         "message": f"Important, not urgent, untouched this week: "
+                                    f"{task.title}"},
+                dedupe_key=f"q2_nudge:{task.id}", requested_at=now))
+        except Exception:
+            log.exception("q2 nudge failed")
+
     def _check_drift(self) -> None:
         try:
             session = self.sessions.current
@@ -555,9 +641,11 @@ class Pipeline:
 
     # --- things the UI asks for --------------------------------------------
 
-    def start_session(self, intent: str, minutes: int) -> list[Event]:
+    def start_session(self, intent: str, minutes: int,
+                      task_id: int | None = None) -> list[Event]:
         try:
-            self.sessions.start(intent, minutes)
+            self.sessions.start(intent, minutes, task_id=task_id)
+            self._load_session_hints()
         except ValueError as e:
             self._emit(STATUS, str(e))
         return self._drain()
@@ -633,3 +721,45 @@ class Pipeline:
     def reminder_dismiss(self, reminder_id: int) -> None:
         self.reminders.dismiss(reminder_id)
         self._ack_interrupt()
+
+    # --- task commands (writes go through the one writer) ------------------
+
+    def create_task(self, **fields) -> dict:
+        from . import tasks as task_store
+        due = fields.pop("due_at", None)
+        if isinstance(due, str) and due:
+            due = from_iso(due)
+        task = task_store.create(self.conn, now=self.clock(), due_at=due, **fields)
+        return task.to_dict()
+
+    def update_task(self, task_id: int, **fields) -> dict | None:
+        from . import tasks as task_store
+        due = fields.get("due_at")
+        if isinstance(due, str) and due:
+            fields["due_at"] = from_iso(due)
+        task = task_store.update(self.conn, task_id, now=self.clock(), **fields)
+        # If the active session's task changed its hints, reload them.
+        self._load_session_hints()
+        return task.to_dict() if task else None
+
+    def set_task_quadrant(self, task_id: int, quadrant: str) -> dict | None:
+        from . import tasks as task_store
+        task = task_store.set_quadrant(self.conn, task_id, quadrant, now=self.clock())
+        return task.to_dict() if task else None
+
+    def reorder_task(self, task_id: int, before=None, after=None) -> dict | None:
+        from . import tasks as task_store
+        task = task_store.reorder(self.conn, task_id, before=before, after=after)
+        return task.to_dict() if task else None
+
+    def delete_task(self, task_id: int) -> None:
+        from . import tasks as task_store
+        task_store.delete(self.conn, task_id)
+
+    def accept_hint(self, task_id: int, app=None, domain=None,
+                    keyword=None) -> dict | None:
+        from . import tasks as task_store
+        task = task_store.add_hint(self.conn, task_id, app=app, domain=domain,
+                                   keyword=keyword, now=self.clock())
+        self._load_session_hints()
+        return task.to_dict() if task else None

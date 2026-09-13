@@ -61,16 +61,19 @@ class SessionManager:
 
     # --- transitions -------------------------------------------------------
 
-    def start(self, intent: str, minutes: int | None = None) -> Session:
+    def start(self, intent: str, minutes: int | None = None,
+              task_id: int | None = None) -> Session:
         intent = (intent or "").strip()
         if not intent:
             raise ValueError("a session needs a declared intent")
         if self.current and self.current.is_open:
             self.end()
         minutes = minutes or self.cfg.session.default_minutes
-        self.current = db.start_session(self.conn, intent, minutes, now=self.clock())
+        self.current = db.start_session(self.conn, intent, minutes,
+                                        now=self.clock(), task_id=task_id)
         self.break_until = None
-        log.info("session %d started: %r (%d min)", self.current.id, intent, minutes)
+        log.info("session %d started: %r (%d min)%s", self.current.id, intent,
+                 minutes, f" [task {task_id}]" if task_id else "")
         self._notify()
         return self.current
 

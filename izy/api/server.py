@@ -41,7 +41,6 @@ log = logging.getLogger(__name__)
 COMMAND_TIMEOUT_S = 2.5
 
 _NOT_YET = {
-    "/tasks": "Phase 3 (tasks + Eisenhower)",
     "/pomodoro": "Phase 4 (pomodoro)",
     "/messages": "Phase 5 (message library)",
 }
@@ -159,8 +158,86 @@ def build_app(command_queue: CommandQueue, state_bus: StateBus, cfg,
     def start_session(body: schemas.SessionCreate):
         minutes = body.minutes or cfg.session.default_minutes
         _wait(command_queue.submit("start_session", intent=body.intent,
-                                   minutes=minutes))
+                                   minutes=minutes, task_id=body.task_id))
         return _accepted(f"session started: {body.intent}")
+
+    # --- tasks (izy-v2.md §3) ----------------------------------------------
+
+    @app.get("/tasks")
+    def list_tasks(status: str | None = None, quadrant: str | None = None,
+                   parent_id: int | None = None):
+        from datetime import datetime
+        from .. import tasks as task_store
+        conn = db.connect_readonly(db_path)
+        try:
+            pid = -1 if parent_id is None else parent_id
+            now = datetime.now().astimezone()
+            out = []
+            for t in task_store.list_tasks(conn, status=status, quadrant=quadrant,
+                                           parent_id=pid):
+                d = t.to_dict()
+                d["looks_urgent"] = task_store.looks_urgent(t, now)
+                d["stale"] = task_store.is_stale_q4(t, now)
+                out.append(d)
+            return out
+        finally:
+            conn.close()
+
+    @app.get("/tasks/{task_id}")
+    def get_task(task_id: int):
+        from .. import tasks as task_store
+        conn = db.connect_readonly(db_path)
+        try:
+            t = task_store.get(conn, task_id)
+            if t is None:
+                raise HTTPException(404, "no such task")
+            return t.to_dict()
+        finally:
+            conn.close()
+
+    @app.post("/tasks", response_model=schemas.Accepted)
+    def create_task(body: schemas.TaskCreate):
+        result = _wait(command_queue.submit(
+            "create_task", **body.model_dump(exclude_none=True)))
+        return schemas.Accepted(ok=True, detail="task created",
+                                task=result, state=_state_out())
+
+    @app.patch("/tasks/{task_id}", response_model=schemas.Accepted)
+    def patch_task(task_id: int, body: schemas.TaskUpdate):
+        fields = body.model_dump(exclude_none=True)
+        result = _wait(command_queue.submit("update_task", task_id=task_id, **fields))
+        if result is None:
+            raise HTTPException(404, "no such task")
+        return schemas.Accepted(ok=True, detail="task updated", task=result)
+
+    @app.post("/tasks/{task_id}/quadrant", response_model=schemas.Accepted)
+    def set_quadrant(task_id: int, body: schemas.QuadrantIn):
+        result = _wait(command_queue.submit("set_task_quadrant", task_id=task_id,
+                                            quadrant=body.quadrant))
+        if result is None:
+            raise HTTPException(404, "no such task")
+        return schemas.Accepted(ok=True, detail=f"moved to {body.quadrant}",
+                                task=result)
+
+    @app.post("/tasks/reorder", response_model=schemas.Accepted)
+    def reorder(body: schemas.ReorderIn):
+        result = _wait(command_queue.submit("reorder_task", task_id=body.task_id,
+                                            before=body.before, after=body.after))
+        return schemas.Accepted(ok=True, detail="reordered", task=result)
+
+    @app.post("/tasks/{task_id}/hints", response_model=schemas.Accepted)
+    def accept_hint(task_id: int, body: schemas.HintIn):
+        result = _wait(command_queue.submit(
+            "accept_hint", task_id=task_id, app=body.app, domain=body.domain,
+            keyword=body.keyword))
+        if result is None:
+            raise HTTPException(404, "no such task")
+        return schemas.Accepted(ok=True, detail="hint added", task=result)
+
+    @app.delete("/tasks/{task_id}", response_model=schemas.Accepted)
+    def delete_task(task_id: int):
+        _wait(command_queue.submit("delete_task", task_id=task_id))
+        return schemas.Accepted(ok=True, detail="task deleted")
 
     @app.post("/sessions/current/stop", response_model=schemas.Accepted)
     def stop_session(body: schemas.StopIn = Body(default=schemas.StopIn())):

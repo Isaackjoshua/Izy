@@ -196,7 +196,7 @@ def test_doctor_reports_schema_and_budget(harness):
 
 # --- future phases are named, not faked ------------------------------------
 
-@pytest.mark.parametrize("path", ["/tasks", "/pomodoro/config", "/messages"])
+@pytest.mark.parametrize("path", ["/pomodoro/config", "/messages"])
 def test_unbuilt_endpoints_return_501_naming_their_phase(harness, path):
     client, *_ = harness
     r = client.get(path)
@@ -232,3 +232,45 @@ def test_stopping_the_api_leaves_the_tick_running(harness):
     after = bus.latest().tick
     assert after > before, "the tick must keep beating with no API attached"
     assert pump.thread.is_alive()
+
+
+# --- Phase 3: tasks over the API -------------------------------------------
+
+def test_tasks_crud_over_the_api(harness):
+    client, *_ = harness
+    r = client.post("/tasks", json={"title": "build the widget", "important": True})
+    assert r.status_code == 200
+    tid = r.json()["task"]["id"]
+    assert r.json()["task"]["quadrant"] == "Q2"
+
+    assert any(t["id"] == tid for t in client.get("/tasks").json())
+
+    client.patch(f"/tasks/{tid}", json={"urgent": True})
+    assert client.get(f"/tasks/{tid}").json()["quadrant"] == "Q1"
+
+    client.post(f"/tasks/{tid}/quadrant", json={"quadrant": "Q4"})
+    assert client.get(f"/tasks/{tid}").json()["quadrant"] == "Q4"
+
+    client.delete(f"/tasks/{tid}")
+    assert client.get(f"/tasks/{tid}").status_code == 404
+
+
+def test_accepting_a_hint_over_the_api(harness):
+    client, *_ = harness
+    tid = client.post("/tasks", json={"title": "x"}).json()["task"]["id"]
+    client.post(f"/tasks/{tid}/hints", json={"app": "zed"})
+    assert "zed" in client.get(f"/tasks/{tid}").json()["hints"]["apps"]
+
+
+def test_a_session_can_be_started_from_a_task(harness):
+    client, pipeline, *_ = harness
+    tid = client.post("/tasks", json={"title": "build it",
+                                      "hints": {"apps": ["obsidian"]}}).json()["task"]["id"]
+    client.post("/sessions", json={"intent": "build it", "minutes": 25, "task_id": tid})
+    _wait_state(client, lambda b: b["phase"] == "focus")
+    # the daemon loaded the task's hints for this session
+    time.sleep(0.1)
+    assert pipeline.classifier._session_hints == {"apps": ["obsidian"]}
+    row = pipeline.conn.execute(
+        "SELECT task_id FROM sessions ORDER BY id DESC LIMIT 1").fetchone()
+    assert row["task_id"] == tid

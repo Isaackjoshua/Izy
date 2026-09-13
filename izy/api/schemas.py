@@ -62,12 +62,50 @@ class ReminderOut(BaseModel):
     status: str
 
 
+class TaskCreate(BaseModel):
+    title: str = Field(min_length=1)
+    notes: Optional[str] = None
+    urgent: bool = False
+    important: bool = False
+    due_at: Optional[str] = None
+    estimate_pomos: Optional[int] = Field(default=None, ge=1)
+    hints: Optional[dict] = None
+    parent_id: Optional[int] = None
+
+
+class TaskUpdate(BaseModel):
+    title: Optional[str] = Field(default=None, min_length=1)
+    notes: Optional[str] = None
+    urgent: Optional[bool] = None
+    important: Optional[bool] = None
+    status: Optional[Literal["todo", "doing", "done", "dropped"]] = None
+    due_at: Optional[str] = None
+    estimate_pomos: Optional[int] = Field(default=None, ge=1)
+
+
+class QuadrantIn(BaseModel):
+    quadrant: Literal["Q1", "Q2", "Q3", "Q4"]
+
+
+class ReorderIn(BaseModel):
+    task_id: int
+    before: Optional[int] = None
+    after: Optional[int] = None
+
+
+class HintIn(BaseModel):
+    app: Optional[str] = None
+    domain: Optional[str] = None
+    keyword: Optional[str] = None
+
+
 class Accepted(BaseModel):
     """Returned by mutations: the command was accepted and applied on the tick,
     with the resulting state attached so a client need not immediately re-GET."""
     ok: bool = True
     detail: Optional[str] = None
     state: Optional[StateOut] = None
+    task: Optional[dict] = None
 
 
 class DoctorOut(BaseModel):

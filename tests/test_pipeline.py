@@ -418,3 +418,66 @@ def test_interrupt_log_survives_and_caps_read_it(conn, cfg, clock):
     fresh.submit(Request("self_label", dedupe_key="b", requested_at=clock()))
     from izy.interrupts import Context
     assert fresh.dispatch(Context(now=clock())) is None, "1/h cap read from the DB"
+
+
+# --- Phase 3: task-backed sessions load hints ------------------------------
+
+def test_a_task_backed_session_classifies_hinted_apps_for_free(conn, cfg, clock):
+    """izy-v2.md §3 phase gate, end to end through the pipeline: start a session
+    from a task, and its hinted app is judged on-task at tier 1 with no paid
+    call — the tier-3 counter stays put."""
+    from izy import tasks as T
+    from tests.test_classifier import _client
+    from izy.llm import LLM
+    client = _client()
+    llm = LLM(conn, cfg, client=client, clock=clock)
+    # a second window closes the Obsidian span so it is eligible for classifying
+    watcher = FakeWatcher([("Obsidian", "widget notes"), ("Zed", "editor")])
+    p = _pipeline(conn, cfg, clock, watcher, llm=llm)
+    p.start()
+
+    task = T.create(conn, "build the widget", hints={"apps": ["obsidian"]}, now=clock())
+    p.start_session("build the widget", 60, task_id=task.id)
+
+    p.tick(); clock.advance(seconds=120)   # opens the Obsidian span
+    p.tick(); clock.advance(seconds=5)      # closes Obsidian, opens Zed
+    p.tick()
+    p._flush_classifier(force=True)
+
+    label = conn.execute(
+        "SELECT source, on_task, reason FROM labels l JOIN activity_events e"
+        " ON e.id = l.event_id WHERE e.app = 'Obsidian' ORDER BY l.id DESC LIMIT 1"
+    ).fetchone()
+    assert label is not None and label["on_task"] == 1
+    assert "task hint" in label["reason"]
+    assert client.calls == [], "hinted app must not reach tier 3"
+
+
+def test_hints_clear_when_the_task_session_ends(conn, cfg, clock):
+    from izy import tasks as T
+    from tests.test_classifier import _client
+    from izy.llm import LLM
+    p = _pipeline(conn, cfg, clock, llm=LLM(conn, cfg, client=_client(), clock=clock))
+    p.start()
+    task = T.create(conn, "x", hints={"apps": ["obsidian"]}, now=clock())
+    p.start_session("x", 60, task_id=task.id)
+    assert p.classifier._session_hints == {"apps": ["obsidian"]}
+    p.end_session("finished")
+    assert p.classifier._session_hints is None, "hints clear at session end"
+
+
+def test_q2_nudge_goes_through_the_arbiter_once_a_week(conn, cfg, clock):
+    from izy import tasks as T
+    p = _pipeline(conn, cfg, clock)
+    p.start()
+    # a neglected Q2 task
+    T.create(conn, "learn rust", important=True, now=clock())
+    clock.advance(minutes=1)
+
+    events = p.tick()
+    statuses = [e.payload[0] for e in events if e.kind == pl.STATUS]
+    assert any("Important, not urgent" in m for m in statuses), \
+        "the neglected Q2 task is surfaced"
+    # a second scan within the hour does not re-nudge
+    clock.advance(minutes=30)
+    assert not any(e.kind == pl.STATUS for e in p.tick())

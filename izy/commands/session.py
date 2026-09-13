@@ -30,8 +30,9 @@ def cmd_start(args) -> int:
     from ..sessions import SessionManager
     sm = SessionManager(conn, cfg)
     sm.recover()
-    s = sm.start(args.intent, args.minutes)
-    print(f"session {s.id} started: {s.declared_intent!r} ({s.planned_minutes}m)")
+    s = sm.start(args.intent, args.minutes, task_id=getattr(args, "task", None))
+    tag = f" [task {args.task}]" if getattr(args, "task", None) else ""
+    print(f"session {s.id} started: {s.declared_intent!r} ({s.planned_minutes}m){tag}")
     return 0
 
 
