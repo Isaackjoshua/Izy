@@ -21,6 +21,7 @@ from . import db
 from .budget import InterruptionBudget
 from .classifier import Classifier
 from .drift import DriftDetector
+from .interrupts import Arbiter, Context, Request
 from .ipc import StateSnapshot
 from .llm import LLM
 from .models import to_iso, utcnow
@@ -61,7 +62,8 @@ class Pipeline:
     RESYNC_EVERY_S = 3.0
 
     def __init__(self, cfg, db_path=None, *, clock=utcnow, watcher=None,
-                 conn=None, llm=None, command_queue=None, state_bus=None) -> None:
+                 conn=None, llm=None, command_queue=None, state_bus=None,
+                 fullscreen=None) -> None:
         self.cfg = cfg
         self.clock = clock
         self.conn = conn if conn is not None else db.connect(db_path)
@@ -84,6 +86,23 @@ class Pipeline:
         self.reminders = ReminderScheduler(self.conn, cfg, clock=clock)
         self.classifier = Classifier(self.conn, cfg, self.llm, clock=clock)
         self.drift = DriftDetector(self.conn, cfg, self.budget, clock=clock)
+
+        # The single dispatch point (izy-v2.md §2). Its caps and cooldown read
+        # the durable interrupt_log, so a restart does not hand out a fresh
+        # allowance; every decision is logged back to the same table.
+        self.arbiter = Arbiter(
+            cfg,
+            log_fn=lambda kind, pri, key, req_at, verdict, reason, now:
+                db.log_interrupt(self.conn, kind, pri, key, req_at, verdict,
+                                 reason, now=now),
+            shown_since=lambda kind, since:
+                db.interrupts_shown_since(self.conn, kind, since),
+            last_shown=lambda: db.last_interrupt_shown(self.conn))
+        #: Best-effort fullscreen/presentation detector. There is no unprivileged
+        #: Wayland API for this, so the default says "no" and it is injectable —
+        #: real detection would need the shell extension (a later phase). The
+        #: gate exists and is tested; only the sensing is stubbed.
+        self._fullscreen = fullscreen or (lambda: False)
 
         self._out: list[Event] = []
         self._last_resync = None
@@ -150,13 +169,14 @@ class Pipeline:
             log.exception("tracker tick failed")
 
         if self.sessions.is_overrun():
-            self._maybe_overrun()
-        self._maybe_self_label()
-        self._check_reminders(snap)
-        self._classify_new_events()
-        self._check_drift()
-        self._update_mascot()
-        self._publish_state()
+            self._maybe_overrun()             # step 4  -> submit
+        self._maybe_self_label()              # step 6  -> submit
+        self._check_reminders(snap)           # step 7  -> submit
+        self._classify_new_events()           # step 9  (may submit tier-4)
+        self._check_drift()                   # step 10 -> submit
+        self._dispatch_interrupts(snap)       # step 11 <- the only place we show
+        self._update_mascot()                 # step 12
+        self._publish_state()                 # step 13
         return self._drain()
 
     def _drain(self) -> list[Event]:
@@ -216,6 +236,56 @@ class Pipeline:
             self.state_bus.publish(self.snapshot())
         except Exception:
             log.exception("state publish failed")
+
+    # --- the interrupt arbiter (step 11) -----------------------------------
+
+    def _arbiter_context(self, snap) -> Context:
+        session = self.sessions.current
+        deep = 0.0
+        if session and self.sessions.phase is Phase.FOCUS:
+            try:
+                deep = self.drift.state(session.id).deep_work_minutes
+            except Exception:
+                deep = 0.0
+        fullscreen = False
+        try:
+            fullscreen = bool(self._fullscreen())
+        except Exception:
+            pass
+        return Context(now=self.clock(), phase=self.sessions.phase.value,
+                       afk=bool(snap.afk) if snap else False,
+                       deep_work_minutes=deep, fullscreen=fullscreen)
+
+    def _dispatch_interrupts(self, snap) -> None:
+        """The one place anything reaches the screen. Everything submitted this
+        tick (and everything still held) is arbitrated; at most one Event is
+        emitted, and only for the request the arbiter chose to SHOW."""
+        try:
+            shown = self.arbiter.dispatch(self._arbiter_context(snap))
+        except Exception:
+            log.exception("arbiter dispatch failed")
+            return
+        if shown is None:
+            return
+        p = shown.payload
+        event = p.get("event")
+        if event == REMINDER:
+            # Only marked fired when actually shown — a deferred reminder must
+            # not be consumed while it waits in the hold queue.
+            self.reminders.fired(p["reminder_id"])
+            self._emit(REMINDER, p["reminder_id"], p["text"])
+        elif event == SELF_LABEL:
+            self._emit(SELF_LABEL, p["event_id"], p["app"], p["title"])
+        elif event == ASK_ON_TASK:
+            self._emit(ASK_ON_TASK, p["event_id"], p["intent"], p["what"])
+        elif event == ASK_OUTCOME:
+            self._emit(ASK_OUTCOME, p["session_id"], p["intent"])
+        elif event == DRIFT:
+            self._emit(DRIFT, p.get("id", 0), p["message"])
+
+    def _ack_interrupt(self) -> None:
+        """A response to whatever is on screen frees the one-at-a-time slot."""
+        self.arbiter.acknowledge()
 
     def snapshot(self) -> StateSnapshot:
         """Build the immutable picture clients read. Pure reads; safe to call
@@ -347,37 +417,34 @@ class Pipeline:
         not conditional on being allowed to ask.
         """
         session = self.sessions.current
-        allowed, reason = self.budget.check("session_overrun")
         self._flush_classifier(force=True)
         self.sessions.end(None)
-        if not allowed:
-            log.debug("outcome prompt suppressed: %s", reason)
-            return
-        self.budget.record("session_overrun", session.declared_intent)
-        self._emit(ASK_OUTCOME, session.id, session.declared_intent)
+        # The session ends regardless; whether the outcome prompt is shown is the
+        # arbiter's call (priority 90, so it clears deep-work and quiet hours).
+        self.arbiter.submit(Request(
+            "session_overrun",
+            payload={"event": ASK_OUTCOME, "session_id": session.id,
+                     "intent": session.declared_intent},
+            dedupe_key=f"overrun:{session.id}", requested_at=self.clock()))
 
     # --- self-label --------------------------------------------------------
 
     def _maybe_self_label(self) -> None:
         if not self.selflabel.due(self.sessions.phase is Phase.BREAK):
             return
-        allowed, reason = self.budget.check("self_label")
-        if not allowed:
-            log.debug("self-label suppressed: %s", reason)
-            # Charge the slot anyway so suppressed prompts do not queue up and
-            # fire in a burst the moment the budget frees.
-            self.selflabel.last_asked = self.clock()
-            return
         row = self.selflabel.pick_event()
-        if row is None:
-            self.selflabel.mark_asked()
-            return
-        # Mark the slot used *before* emitting. This is the whole fix: the emit
-        # path used to leave last_asked untouched, so due() stayed true and the
-        # prompt re-fired every tick. The dismissal/answer is recorded when the
-        # user responds (skip/record), so it is not recorded again here.
+        # Mark the slot used whether or not this ends up shown: the hourly gate
+        # is about how often we *ask*, and re-submitting every tick would flood
+        # the arbiter. The arbiter's 1/h cap is the second layer; the show/defer
+        # decision is entirely its call now.
         self.selflabel.mark_asked()
-        self._emit(SELF_LABEL, row["id"], row["app"] or "", row["window_title"] or "")
+        if row is None:
+            return
+        self.arbiter.submit(Request(
+            "self_label",
+            payload={"event": SELF_LABEL, "event_id": row["id"],
+                     "app": row["app"] or "", "title": row["window_title"] or ""},
+            dedupe_key=f"self_label:{row['id']}", requested_at=self.clock()))
 
     # --- classification ----------------------------------------------------
 
@@ -408,23 +475,28 @@ class Pipeline:
         if decisions:
             log.debug("classified %d event(s) via tier 3", len(decisions))
         for pending in ask:
-            # Tier 4. Asking is free and honest; guessing is neither.
-            allowed, reason = self.budget.check("self_label")
-            if not allowed:
-                log.debug("tier 4 question suppressed: %s", reason)
-                break
-            self.budget.record("self_label", pending.title)
-            self._emit(ASK_ON_TASK, pending.event_id, pending.intent,
-                       pending.title or pending.app or "that window")
+            # Tier 4 asks are self-label questions too — same UX, same priority,
+            # same 1/h cap. Submit them all; the arbiter shows at most one and
+            # drops the rest over cap. Asking is honest, but not endlessly.
+            self.arbiter.submit(Request(
+                "self_label",
+                payload={"event": ASK_ON_TASK, "event_id": pending.event_id,
+                         "intent": pending.intent,
+                         "what": pending.title or pending.app or "that window"},
+                dedupe_key=f"ask_on_task:{pending.event_id}",
+                requested_at=self.clock()))
 
     def _check_drift(self) -> None:
         try:
             session = self.sessions.current
             if not session:
                 return
-            result = self.drift.check(session.id, session.declared_intent)
-            if result:
-                self._emit(DRIFT, result[1], result[0])
+            message = self.drift.detect(session.id, session.declared_intent)
+            if message:
+                self.arbiter.submit(Request(
+                    "drift",
+                    payload={"event": DRIFT, "id": 0, "message": message},
+                    dedupe_key=f"drift:{session.id}", requested_at=self.clock()))
         except Exception:
             log.exception("drift check failed")
 
@@ -454,8 +526,16 @@ class Pipeline:
             log.exception("reminder check failed")
 
     def _fire(self, reminder) -> None:
-        self.reminders.fired(reminder.id)
-        self._emit(REMINDER, reminder.id, reminder.text)
+        """Submit a due reminder to the arbiter. It is marked fired only when the
+        arbiter actually shows it (see _dispatch_interrupts), so a deferred one
+        is not consumed while it waits. Urgent reminders ride priority 100 and so
+        clear deep-work, quiet hours and fullscreen."""
+        urgent = reminder.raw_text.lower().startswith("[urgent]")
+        self.arbiter.submit(Request(
+            "urgent_reminder" if urgent else "reminder",
+            payload={"event": REMINDER, "reminder_id": reminder.id,
+                     "text": reminder.text},
+            dedupe_key=f"reminder:{reminder.id}", requested_at=self.clock()))
 
     def _write_retrospective(self) -> None:
         """SPEC.md Feature 5: regenerated automatically at end of day.
@@ -503,19 +583,24 @@ class Pipeline:
             self.sessions.record_outcome(session_id, outcome)
         except ValueError as e:
             log.warning("ignoring bad outcome: %s", e)
+        self._ack_interrupt()
 
     def record_self_label(self, event_id: int, on_task: bool) -> None:
         self.selflabel.record(event_id, on_task)
+        self._ack_interrupt()
 
     def skip_self_label(self) -> None:
         self.selflabel.skip()
+        self._ack_interrupt()
 
     def record_on_task_answer(self, event_id: int, on_task: bool) -> None:
         self.classifier.record_user_answer(event_id, on_task)
+        self._ack_interrupt()
 
     def record_drift_response(self, intervention_id: int, response: str) -> None:
-        """A dismissal starts the 15-minute cooldown, so this must be recorded."""
-        self.budget.resolve(intervention_id, response)
+        """Any response frees the one-at-a-time slot. The 90s global cooldown
+        (arbiter) is what spaces the next one now, not a per-dismissal cooldown."""
+        self._ack_interrupt()
 
     def add_reminder(self, raw: str) -> list[Event]:
         """Parse and store. Asks rather than guessing when nothing is readable —
@@ -539,9 +624,12 @@ class Pipeline:
 
     def reminder_done(self, reminder_id: int) -> None:
         self.reminders.done(reminder_id)
+        self._ack_interrupt()
 
     def reminder_snooze(self, reminder_id: int) -> None:
         self.reminders.snooze(reminder_id)
+        self._ack_interrupt()
 
     def reminder_dismiss(self, reminder_id: int) -> None:
         self.reminders.dismiss(reminder_id)
+        self._ack_interrupt()

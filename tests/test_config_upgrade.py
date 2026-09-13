@@ -69,7 +69,7 @@ def test_parse_finds_every_shipped_section():
 def test_a_phase1_file_is_reported_as_missing_the_later_sections():
     plan = plan_for(PHASE1_CONFIG)
     assert set(plan.added_sections) == {"llm", "reminders", "classify",
-                                        "drift", "capture"}
+                                        "drift", "interrupts", "capture"}
     assert plan.empty is False
     assert "llm" in plan.describe()
 

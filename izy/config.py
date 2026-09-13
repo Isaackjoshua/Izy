@@ -177,6 +177,25 @@ enabled = true
 # Set false to classify silently and only see it in the retrospective.
 
 
+# The interrupt arbiter (izy-v2.md §2). Every would-be interruption — a drift
+# alert, a reminder, the hourly self-label — becomes a request, and this one
+# place decides whether it reaches your screen. It is what stops five different
+# features each deciding on their own to talk to you at once. When in doubt
+# these numbers go DOWN: a quiet Izy is a kept Izy.
+[interrupts]
+# Never show two interrupts closer together than this, whatever their priority.
+global_cooldown_s = 90
+
+# Windows during which nothing below priority 90 (drift, self-label, messages)
+# is shown at all. Each is ["HH:MM","HH:MM"] local; a window may wrap midnight.
+# Urgent reminders and end-of-session prompts still come through.
+quiet_hours = []
+
+# Per-kind hourly ceilings. Drift uses interruptions.max_per_hour above.
+self_label_per_hour = 1
+message_per_hour = 2
+
+
 # Screen capture. Off by default, and it should probably stay that way.
 #
 # When enabled, Izy may photograph the focused window to help judge an
@@ -302,6 +321,14 @@ class DriftConfig:
 
 
 @dataclass(frozen=True)
+class InterruptsConfig:
+    global_cooldown_s: int = 90
+    quiet_hours: tuple = ()          # tuple of ["HH:MM","HH:MM"] windows
+    self_label_per_hour: int = 1
+    message_per_hour: int = 2
+
+
+@dataclass(frozen=True)
 class CaptureConfig:
     enabled: bool = False
     blocklist: tuple = ()
@@ -327,6 +354,7 @@ class Config:
     reminders: RemindersConfig = field(default_factory=RemindersConfig)
     classify: ClassifyConfig = field(default_factory=ClassifyConfig)
     drift: DriftConfig = field(default_factory=DriftConfig)
+    interrupts: InterruptsConfig = field(default_factory=InterruptsConfig)
     capture: CaptureConfig = field(default_factory=CaptureConfig)
     mascot: MascotConfig = field(default_factory=MascotConfig)
 
@@ -340,6 +368,7 @@ _SECTIONS = {
     "reminders": RemindersConfig,
     "classify": ClassifyConfig,
     "drift": DriftConfig,
+    "interrupts": InterruptsConfig,
     "capture": CaptureConfig,
     "mascot": MascotConfig,
 }

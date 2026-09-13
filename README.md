@@ -122,6 +122,26 @@ rule you add is a call you never pay for again.
 Correct a wrong call with `izy relabel <event-id> on|off`; `izy day` prints the
 audit of every tier 3 and tier 4 decision with its reason.
 
+## The interrupt arbiter
+
+Since the v2 control plane, every would-be interruption — a drift alert, a due
+reminder, the hourly self-label, the end-of-session outcome — is a *request*,
+and one place (`izy/interrupts/arbiter.py`) decides whether it reaches the
+screen. This is the fix for the class of bug that made Izy feel useless: five
+features each deciding on their own to talk to you. The tick submits requests;
+`arbiter.dispatch()` shows at most one and logs a verdict for every other to
+`interrupt_log`, so "why did it nag me at 14:02" is answerable.
+
+Priority high-to-low: urgent reminder, session outcome, due reminder, drift,
+self-label, pomodoro, message. Gates, in order: one unacknowledged interrupt
+blocks all others; a 90 s global cooldown; quiet hours drop anything below the
+outcome prompt; a deep-work streak defers the same; fullscreen defers all but
+urgent; **away defers, never drops** (you weren't there to see it); and per-kind
+hourly caps. Deferred requests wait in a hold queue and surface the moment their
+gate lifts — which is "held to the next natural boundary", generalised.
+
+Configure it in `[interrupts]`. When in doubt those numbers go down.
+
 ## Drift alerts
 
 The only thing Izy says unprompted about your work, and deliberately hard to

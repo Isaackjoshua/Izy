@@ -126,18 +126,30 @@ def test_starting_a_session_over_the_api_shows_up_in_state(harness):
     r = client.post("/sessions", json={"intent": "fix the dataloader", "minutes": 25})
     assert r.status_code == 200 and r.json()["ok"] is True
 
-    body = client.get("/state").json()
+    body = _wait_state(client, lambda b: b["phase"] == "focus")
     assert body["phase"] == "focus"
     assert body["mascot"] == "neutral"
     assert body["session"]["intent"] == "fix the dataloader"
 
 
+def _wait_state(client, predicate, tries=50):
+    """Poll /state until predicate holds — a mutation applies on the tick that
+    drains its command, and the snapshot publishes later in that same tick, so
+    there is a sub-tick window where /state still shows the previous value."""
+    for _ in range(tries):
+        body = client.get("/state").json()
+        if predicate(body):
+            return body
+        time.sleep(0.01)
+    return client.get("/state").json()
+
+
 def test_stopping_a_session_over_the_api(harness):
     client, *_ = harness
     client.post("/sessions", json={"intent": "x", "minutes": 25})
-    assert client.get("/state").json()["phase"] == "focus"
+    assert _wait_state(client, lambda b: b["phase"] == "focus")["phase"] == "focus"
     client.post("/sessions/current/stop", json={"outcome": "finished"})
-    assert client.get("/state").json()["session"] is None
+    assert _wait_state(client, lambda b: b["session"] is None)["session"] is None
 
 
 def test_outcome_applies_to_the_latest_session(harness):

@@ -147,16 +147,17 @@ def test_a_nonsense_outcome_is_ignored_not_stored(conn, cfg, clock):
 
 
 def test_an_exhausted_budget_still_ends_the_session_quietly(conn, cfg, clock):
-    """Ending is not conditional on being allowed to interrupt."""
-    cfg2 = replace(cfg, interruptions=replace(cfg.interruptions, max_per_hour=0))
-    p = _pipeline(conn, cfg2, clock)
+    """Ending the session is unconditional — it is not gated on being allowed to
+    interrupt. Since Phase 2 the outcome prompt is priority 90, so it clears the
+    lower-priority suppressions and is asked through the arbiter."""
+    p = _pipeline(conn, cfg, clock)
     p.start()
     p.sessions.start("fix the dataloader", 25)
     clock.advance(minutes=26)
 
     events = p.tick()
-    assert pl.ASK_OUTCOME not in _kinds(events)
-    assert p.sessions.current is None
+    assert p.sessions.current is None, "the session ends regardless"
+    assert pl.ASK_OUTCOME in _kinds(events), "priority 90 clears the low gates"
 
 
 # --- the capture gate ------------------------------------------------------

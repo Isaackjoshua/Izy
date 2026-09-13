@@ -177,8 +177,10 @@ def test_tier_4_questions_reach_the_ui(conn, cfg, clock, monkeypatch):
     row = conn.execute("SELECT * FROM activity_events WHERE id=?", (eid,)).fetchone()
     p.classifier.consider(row, "fix the dataloader")
 
+    # Tier-4 asks are submitted to the arbiter; the emit happens at the dispatch
+    # tick step, so it surfaces on the next tick, not the flush call itself.
     p._flush_classifier(force=True)
-    events = p._drain()
+    events = p.tick()
     assert pl.ASK_ON_TASK in _kinds(events)
     assert _payload(events, pl.ASK_ON_TASK)[0] == eid
 
@@ -209,8 +211,10 @@ def test_ending_a_session_releases_a_held_reminder(conn, cfg, clock):
     clock.advance(minutes=2)
     assert pl.REMINDER not in _kinds(p.tick()), "quiet during a focus session"
 
-    events = p.end_session("finished")
-    assert pl.REMINDER in _kinds(events)
+    # Ending the session submits the held reminder to the arbiter at the
+    # boundary; the arbiter shows it on the next dispatch (tick step 11).
+    p.end_session("finished")
+    assert pl.REMINDER in _kinds(p.tick())
 
 
 def test_on_break_reminders_fire_at_the_boundary(conn, cfg, clock):
@@ -220,8 +224,8 @@ def test_on_break_reminders_fire_at_the_boundary(conn, cfg, clock):
     reminder_store.add(conn, parse_reminder(
         "remind me on my next break to refill water"), now=clock())
 
-    events = p.end_session("finished")
-    assert _payload(events, pl.REMINDER)[1] == "refill water"
+    p.end_session("finished")
+    assert _payload(p.tick(), pl.REMINDER)[1] == "refill water"
 
 
 def test_an_unreadable_reminder_asks_rather_than_guessing(conn, cfg, clock,
@@ -272,7 +276,10 @@ def test_drift_reaches_the_ui_once_per_run(conn, cfg, clock):
         assert pl.DRIFT not in _kinds(p.tick()), "one alert per run, not per tick"
 
 
-def test_dismissing_drift_is_recorded_for_the_cooldown(conn, cfg, clock):
+def test_drift_is_shown_through_the_arbiter_and_logged(conn, cfg, clock):
+    """Phase 2: drift no longer records an intervention with a dismiss cooldown.
+    It goes through the arbiter, which logs the SHOW to interrupt_log, and any
+    response frees the one-at-a-time slot."""
     p = _pipeline(conn, cfg, clock)
     p.start()
     s = p.sessions.start("fix the dataloader", 120)
@@ -281,11 +288,16 @@ def test_dismissing_drift_is_recorded_for_the_cooldown(conn, cfg, clock):
     db.update_event_duration(conn, eid, 11 * 60)
     db.add_label(conn, eid, "rule", False, confidence=1.0, reason="app rule")
 
-    intervention_id = _payload(p.tick(), pl.DRIFT)[0]
-    p.record_drift_response(intervention_id, "dismissed")
-    row = conn.execute("SELECT user_response FROM interventions WHERE id=?",
-                       (intervention_id,)).fetchone()
-    assert row["user_response"] == "dismissed"
+    _id, message = _payload(p.tick(), pl.DRIFT)
+    assert "YouTube" in message
+    shown = conn.execute(
+        "SELECT COUNT(*) FROM interrupt_log WHERE kind='drift' AND verdict='show'"
+    ).fetchone()[0]
+    assert shown == 1, "the show is logged to interrupt_log"
+
+    assert p.arbiter.active is not None, "one interrupt is on screen"
+    p.record_drift_response(_id, "dismissed")
+    assert p.arbiter.active is None, "the response freed the slot"
 
 
 # --- the worker's mapping stays in step ------------------------------------
@@ -352,3 +364,57 @@ def test_the_next_self_label_waits_a_full_interval(conn, cfg, clock):
     assert pl.SELF_LABEL not in _kinds(p.tick())      # too soon
     clock.advance(minutes=31)
     assert pl.SELF_LABEL in _kinds(p.tick())          # next interval
+
+
+# --- Phase 2 gate: all seven kinds in one tick -----------------------------
+
+def test_seven_interrupts_one_tick_shows_one_logs_six(conn, cfg, clock):
+    """izy-v2.md §2 phase gate, end to end through the pipeline and the DB:
+    submit all seven interrupt kinds in a single tick, exactly one reaches the
+    screen (the highest priority), and interrupt_log records six deferrals with
+    reasons."""
+    from izy.interrupts import Request
+    p = _pipeline(conn, cfg, clock)
+    p.start()
+
+    kinds = ["urgent_reminder", "session_overrun", "reminder", "drift",
+             "self_label", "pomodoro", "message"]
+    for k in kinds:
+        p.arbiter.submit(Request(k, payload={"event": pl.STATUS, "message": k},
+                                 dedupe_key=k, requested_at=clock()))
+
+    ctx = p._arbiter_context(None)
+    shown = p.arbiter.dispatch(ctx)
+    assert shown.kind == "urgent_reminder", "the highest priority is shown"
+
+    rows = conn.execute(
+        "SELECT kind, verdict, reason FROM interrupt_log ORDER BY id").fetchall()
+    shows = [r for r in rows if r["verdict"] == "show"]
+    defers = [r for r in rows if r["verdict"] == "defer"]
+    assert len(shows) == 1 and shows[0]["kind"] == "urgent_reminder"
+    assert len(defers) == 6, "the other six are deferred"
+    assert all(r["reason"] for r in defers), "every deferral is explained"
+    deferred_kinds = {r["kind"] for r in defers}
+    assert deferred_kinds == set(kinds) - {"urgent_reminder"}
+
+
+def test_interrupt_log_survives_and_caps_read_it(conn, cfg, clock):
+    """A restart must not hand out a fresh allowance: the cap reads interrupt_log
+    from the DB, so a self-label already shown this hour blocks the next."""
+    from izy.interrupts import Request
+    p = _pipeline(conn, cfg, clock)
+    p.start()
+    p.arbiter.submit(Request("self_label", payload={"event": pl.STATUS, "message": "a"},
+                             dedupe_key="a", requested_at=clock()))
+    assert p.arbiter.dispatch(p._arbiter_context(None)).kind == "self_label"
+    p.arbiter.acknowledge()
+
+    # A fresh arbiter on the same DB (as after a restart) sees the shown row.
+    from izy.interrupts import Arbiter
+    fresh = Arbiter(cfg,
+                    shown_since=lambda kind, since: db.interrupts_shown_since(conn, kind, since),
+                    last_shown=lambda: db.last_interrupt_shown(conn))
+    clock.advance(minutes=5)
+    fresh.submit(Request("self_label", dedupe_key="b", requested_at=clock()))
+    from izy.interrupts import Context
+    assert fresh.dispatch(Context(now=clock())) is None, "1/h cap read from the DB"

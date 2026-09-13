@@ -16,7 +16,32 @@ from pathlib import Path
 from . import paths
 from .models import Session, Snapshot, from_iso, to_iso, utcnow
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+#: Forward-only, numbered migrations (izy-v2.md §9). The base SCHEMA below is the
+#: v2 baseline created idempotently; anything a later version adds lives here as
+#: a numbered step, applied in order to a DB that predates it. A fresh DB gets
+#: the base SCHEMA (= v2) and then every migration above 2, so both paths — new
+#: install and upgrade — converge on the same shape. `izy doctor` reports the
+#: version, and the writer backs the file up before applying any of these.
+MIGRATIONS: dict[int, str] = {
+    3: """
+    -- Phase 2: every arbiter decision, so we can answer "why did it nag me at
+    -- 14:02" and so the Reports screen can show an interruptions panel.
+    CREATE TABLE IF NOT EXISTS interrupt_log (
+        id           INTEGER PRIMARY KEY,
+        ts           TEXT NOT NULL,       -- when the decision was made
+        kind         TEXT NOT NULL,       -- drift | self_label | reminder | ...
+        priority     INTEGER NOT NULL,
+        dedupe_key   TEXT,
+        requested_at TEXT NOT NULL,       -- when the request was first submitted
+        verdict      TEXT NOT NULL,       -- show | defer | drop
+        reason       TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_interrupt_log_ts   ON interrupt_log(ts);
+    CREATE INDEX IF NOT EXISTS idx_interrupt_log_kind ON interrupt_log(kind, verdict);
+    """,
+}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -119,7 +144,7 @@ def connect_readonly(path: Path | None = None) -> sqlite3.Connection:
 
 
 def connect(path: Path | None = None) -> sqlite3.Connection:
-    path = path or paths.db_path()
+    path = Path(path) if path is not None else paths.db_path()
     if str(path) != ":memory:":
         path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
@@ -127,13 +152,49 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    # The base SCHEMA is the v2 baseline: idempotent creates for every table
+    # that existed at v2. A brand-new DB has no stored version, so it is treated
+    # as being at the baseline and then brought forward by the migrations below.
+    stored = _stored_version(conn)
     conn.executescript(SCHEMA)
+    _migrate(conn, path, baseline=2 if stored is None else stored)
+    return conn
+
+
+def _stored_version(conn) -> int | None:
+    try:
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'").fetchone()
+        return int(row["value"]) if row else None
+    except sqlite3.OperationalError:
+        return None       # meta doesn't exist yet — a genuinely fresh file
+
+
+def _migrate(conn, path, *, baseline: int) -> None:
+    """Apply numbered migrations above `baseline`, backing the file up first."""
+    pending = sorted(v for v in MIGRATIONS if v > baseline)
+    if pending and str(path) != ":memory:":
+        _backup(path, baseline)
+    for version in pending:
+        conn.executescript(MIGRATIONS[version])
+    final = max([baseline, SCHEMA_VERSION, *pending])
     conn.execute(
         "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (str(SCHEMA_VERSION),),
-    )
-    return conn
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(final),))
+
+
+def _backup(path, baseline: int) -> None:
+    """Copy the DB before a migration touches it (izy-v2.md §9). Best-effort:
+    a failed backup logs but does not block the upgrade, because refusing to
+    start is worse than a missing copy of an already-committed WAL DB."""
+    import shutil
+    try:
+        dest = Path(str(path) + f".premigrate-v{baseline}")
+        if not dest.exists():
+            shutil.copy2(path, dest)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning("could not back up %s before migrating", path)
 
 
 # --- sessions ---------------------------------------------------------------
@@ -270,6 +331,44 @@ def interventions_since(conn, since: datetime) -> list[sqlite3.Row]:
     return conn.execute(
         "SELECT * FROM interventions WHERE ts >= ? ORDER BY ts", (to_iso(since),)
     ).fetchall()
+
+
+# --- interrupt log (the arbiter's decisions) --------------------------------
+
+def log_interrupt(conn, kind: str, priority: int, dedupe_key: str | None,
+                  requested_at: datetime, verdict: str, reason: str,
+                  *, now=None) -> int:
+    cur = conn.execute(
+        "INSERT INTO interrupt_log(ts, kind, priority, dedupe_key, requested_at,"
+        " verdict, reason) VALUES (?,?,?,?,?,?,?)",
+        (to_iso(now or utcnow()), kind, priority, dedupe_key,
+         to_iso(requested_at), verdict, reason),
+    )
+    return cur.lastrowid
+
+
+def interrupts_shown_since(conn, kind: str, since: datetime) -> int:
+    """How many of one kind were actually shown since `since` — the arbiter's
+    per-kind hourly cap and global cooldown are computed from this, so they
+    survive a restart instead of resetting to a fresh allowance."""
+    return conn.execute(
+        "SELECT COUNT(*) FROM interrupt_log"
+        " WHERE kind = ? AND verdict = 'show' AND ts >= ?",
+        (kind, to_iso(since))).fetchone()[0]
+
+
+def last_interrupt_shown(conn) -> datetime | None:
+    row = conn.execute(
+        "SELECT ts FROM interrupt_log WHERE verdict = 'show'"
+        " ORDER BY id DESC LIMIT 1").fetchone()
+    return from_iso(row["ts"]) if row else None
+
+
+def interrupt_log_for_day(conn, day: datetime) -> list[sqlite3.Row]:
+    lo, hi = _day_bounds(day)
+    return conn.execute(
+        "SELECT * FROM interrupt_log WHERE ts >= ? AND ts < ? ORDER BY id",
+        (lo, hi)).fetchall()
 
 
 # --- helpers ----------------------------------------------------------------
