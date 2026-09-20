@@ -5,7 +5,7 @@ whether you're working on what you said you'd work on, holds reminders you give
 it in natural language, and shows an end-of-day retrospective of where your
 attention actually went.
 
-Personal tool, one machine, one per Nothing leaves the machine.
+Personal tool, one machine, one  Nothing leaves the machine.
 `SPEC.md` is the source of truth for scope.
 
 **Status: all five phases complete.** Izy logs where your attention goes, holds
